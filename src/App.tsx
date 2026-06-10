@@ -2413,7 +2413,7 @@ ${cellsXml}      </root>
 
     // 3. Render Partition Walls
     walls.forEach((wall) => {
-      svgContent += `  <line id="wall-${wall.id}" x1="${wall.startX}" y1="${wall.startY}" x2="${wall.endX}" y2="${wall.endY}" stroke="#1e293b" stroke-width="6" stroke-linecap="round" />\n`;
+      svgContent += `  <line id="wall-${wall.id}" x1="${wall.x1}" y1="${wall.y1}" x2="${wall.x2}" y2="${wall.y2}" stroke="#1e293b" stroke-width="6" stroke-linecap="round" />\n`;
     });
     svgContent += `\n`;
 
@@ -3425,6 +3425,9 @@ ${cellsXml}      </root>
 
               {/* 2. Drawing ALL Walls segments */}
               {sheetWalls.map((wall) => {
+                if (![wall.x1, wall.y1, wall.x2, wall.y2].every((n) => Number.isFinite(n))) {
+                  return null;
+                }
                 const isSelected = selectedElement.type === "wall" && selectedElement.id === wall.id;
                 const { thickness, color, dashed } = getWallStyle(wall.type, themeMode);
 
@@ -3558,6 +3561,16 @@ ${cellsXml}      </root>
 
               {/* 4b. Drawing ALL placed Fixtures / Furniture stamps */}
               {sheetFixtures.map((fixture) => {
+                if (
+                  !Number.isFinite(fixture.x) ||
+                  !Number.isFinite(fixture.y) ||
+                  !Number.isFinite(fixture.width) ||
+                  !Number.isFinite(fixture.height) ||
+                  fixture.width < 4 ||
+                  fixture.height < 4
+                ) {
+                  return null;
+                }
                 const isSelected = selectedElement.type === "fixture" && selectedElement.id === fixture.id;
                 const halfW = fixture.width / 2;
                 const halfH = fixture.height / 2;

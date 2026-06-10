@@ -1,6 +1,7 @@
-type WallSeg = { x1: number; y1: number; x2: number; y2: number };
-type Opening = { x: number; y: number; width: number; orientation?: string; [k: string]: unknown };
+type WallSeg = { id?: string; x1: number; y1: number; x2: number; y2: number; type?: string; [k: string]: unknown };
+type Opening = { id?: string; x: number; y: number; width: number; orientation?: string; [k: string]: unknown };
 type Fixture = {
+  id?: string;
   type: string;
   x: number;
   y: number;
@@ -10,6 +11,175 @@ type Fixture = {
   label?: string;
   [k: string]: unknown;
 };
+
+type RoomMeta = {
+  id?: string;
+  name?: string;
+  x?: number;
+  y?: number;
+  estimatedAreaM2?: number;
+  estimatedWidthM?: number;
+  estimatedDepthM?: number;
+  [k: string]: unknown;
+};
+
+function toInt(value: unknown, fallback = 0): number {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.round(value);
+  if (typeof value === "string") {
+    const parsed = parseFloat(value);
+    if (Number.isFinite(parsed)) return Math.round(parsed);
+  }
+  return fallback;
+}
+
+function isFiniteCoord(...values: number[]): boolean {
+  return values.every((v) => Number.isFinite(v));
+}
+
+function extractWallCoords(raw: Record<string, unknown>): { x1: number; y1: number; x2: number; y2: number } | null {
+  if (
+    raw.x1 != null ||
+    raw.startX != null ||
+    raw.start_x != null ||
+    raw.start != null ||
+    raw.points != null
+  ) {
+    const start = raw.start as { x?: unknown; y?: unknown } | undefined;
+    const end = raw.end as { x?: unknown; y?: unknown } | undefined;
+    const points = raw.points as Array<{ x?: unknown; y?: unknown }> | undefined;
+
+    const x1 = toInt(raw.x1 ?? raw.startX ?? raw.start_x ?? start?.x, NaN);
+    const y1 = toInt(raw.y1 ?? raw.startY ?? raw.start_y ?? start?.y, NaN);
+    const x2 = toInt(raw.x2 ?? raw.endX ?? raw.end_x ?? end?.x ?? points?.[1]?.x, NaN);
+    const y2 = toInt(raw.y2 ?? raw.endY ?? raw.end_y ?? end?.y ?? points?.[1]?.y, NaN);
+
+    if (isFiniteCoord(x1, y1, x2, y2)) {
+      return { x1, y1, x2, y2 };
+    }
+  }
+  return null;
+}
+
+function sanitizeWalls(rawWalls: unknown): WallSeg[] {
+  if (!Array.isArray(rawWalls)) return [];
+  const result: WallSeg[] = [];
+
+  rawWalls.forEach((item, index) => {
+    if (!item || typeof item !== "object") return;
+    const raw = item as Record<string, unknown>;
+    const coords = extractWallCoords(raw);
+    if (!coords) return;
+    const length = Math.hypot(coords.x2 - coords.x1, coords.y2 - coords.y1);
+    if (length < 2) return;
+
+    result.push({
+      ...raw,
+      id: typeof raw.id === "string" ? raw.id : `wall_${index + 1}`,
+      type: typeof raw.type === "string" ? raw.type : "interior",
+      ...coords,
+    });
+  });
+
+  return result;
+}
+
+function sanitizeOpenings(rawItems: unknown, prefix: string): Opening[] {
+  if (!Array.isArray(rawItems)) return [];
+
+  return rawItems
+    .map((item, index) => {
+      if (!item || typeof item !== "object") return null;
+      const raw = item as Record<string, unknown>;
+      const x = toInt(raw.x ?? raw.centerX ?? raw.center_x, NaN);
+      const y = toInt(raw.y ?? raw.centerY ?? raw.center_y, NaN);
+      const width = Math.max(8, toInt(raw.width, 60));
+      if (!isFiniteCoord(x, y)) return null;
+
+      const orientation = typeof raw.orientation === "string" ? raw.orientation : "h";
+      return {
+        ...raw,
+        id: typeof raw.id === "string" ? raw.id : `${prefix}_${index + 1}`,
+        x,
+        y,
+        width,
+        orientation,
+      } as Opening;
+    })
+    .filter((item): item is Opening => item !== null);
+}
+
+const MIN_FIXTURE_SIZE: Record<string, { w: number; h: number }> = {
+  sofa: { w: 80, h: 36 },
+  bed: { w: 100, h: 80 },
+  table: { w: 44, h: 44 },
+  cabinet: { w: 40, h: 28 },
+  wall_cabinet: { w: 40, h: 20 },
+  counter: { w: 48, h: 24 },
+  island: { w: 60, h: 40 },
+  stove: { w: 36, h: 36 },
+  sink: { w: 32, h: 28 },
+  fridge: { w: 36, h: 40 },
+  toilet: { w: 28, h: 40 },
+  bathtub: { w: 60, h: 32 },
+  shower: { w: 36, h: 36 },
+};
+
+function sanitizeFixtures(rawFixtures: unknown): Fixture[] {
+  if (!Array.isArray(rawFixtures)) return [];
+
+  return rawFixtures
+    .map((item, index) => {
+      if (!item || typeof item !== "object") return null;
+      const raw = item as Record<string, unknown>;
+      const type = normalizeFixtureType(typeof raw.type === "string" ? raw.type : "table");
+      const mins = MIN_FIXTURE_SIZE[type] ?? { w: 20, h: 20 };
+      const x = toInt(raw.x, NaN);
+      const y = toInt(raw.y, NaN);
+      const width = Math.max(mins.w, toInt(raw.width, mins.w));
+      const height = Math.max(mins.h, toInt(raw.height, mins.h));
+      if (!isFiniteCoord(x, y)) return null;
+
+      return {
+        ...raw,
+        id: typeof raw.id === "string" ? raw.id : `fixture_${index + 1}`,
+        type,
+        x,
+        y,
+        width,
+        height,
+        rotation: normalizeFixtureRotation(raw.rotation),
+        label: typeof raw.label === "string" ? raw.label : undefined,
+      } as Fixture;
+    })
+    .filter((item): item is Fixture => item !== null);
+}
+
+function sanitizeRooms(rawRooms: unknown): RoomMeta[] {
+  if (!Array.isArray(rawRooms)) return [];
+
+  return rawRooms
+    .map((item, index) => {
+      if (!item || typeof item !== "object") return null;
+      const raw = item as Record<string, unknown>;
+      const x = toInt(raw.x, NaN);
+      const y = toInt(raw.y, NaN);
+      if (!isFiniteCoord(x, y)) return null;
+      return {
+        ...raw,
+        id: typeof raw.id === "string" ? raw.id : `room_${index + 1}`,
+        name: typeof raw.name === "string" ? raw.name : `Room ${index + 1}`,
+        x,
+        y,
+        estimatedWidthM:
+          typeof raw.estimatedWidthM === "number" ? raw.estimatedWidthM : undefined,
+        estimatedDepthM:
+          typeof raw.estimatedDepthM === "number" ? raw.estimatedDepthM : undefined,
+        estimatedAreaM2:
+          typeof raw.estimatedAreaM2 === "number" ? raw.estimatedAreaM2 : undefined,
+      } as RoomMeta;
+    })
+    .filter((item): item is RoomMeta => item !== null);
+}
 
 /** Normalize AI rotation to 0–359 integer degrees */
 export function normalizeFixtureRotation(raw: unknown): number {
@@ -204,8 +374,9 @@ function scaleFixturesToRoom(fixtures: Fixture[], walls: WallSeg[]): Fixture[] {
     const y = Math.max(box.minY + height / 2, Math.min(box.maxY - height / 2, f.y));
     const rotation = normalizeFixtureRotation(f.rotation);
     // width = longer plan axis for seating; swap if model inverted aspect for sofas/beds
-    let w = Math.round(width);
-    let h = Math.round(height);
+    const mins = MIN_FIXTURE_SIZE[type] ?? { w: 20, h: 20 };
+    let w = Math.max(mins.w, Math.round(width));
+    let h = Math.max(mins.h, Math.round(height));
     if ((type === "sofa" || type === "bed") && h > w) {
       [w, h] = [h, w];
       return { ...f, type, width: w, height: h, x: Math.round(x), y: Math.round(y), rotation: (rotation + 90) % 360 };
@@ -213,13 +384,6 @@ function scaleFixturesToRoom(fixtures: Fixture[], walls: WallSeg[]): Fixture[] {
     return { ...f, type, width: w, height: h, x: Math.round(x), y: Math.round(y), rotation };
   });
 }
-
-type RoomMeta = {
-  estimatedAreaM2?: number;
-  estimatedWidthM?: number;
-  estimatedDepthM?: number;
-  [k: string]: unknown;
-};
 
 function normalizeRoomDimensions(walls: WallSeg[], rooms: RoomMeta[]): RoomMeta[] {
   if (rooms.length === 0) return rooms;
@@ -251,11 +415,11 @@ function normalizeRoomDimensions(walls: WallSeg[], rooms: RoomMeta[]): RoomMeta[
 }
 
 export function postProcessExtraction(raw: Record<string, unknown>): Record<string, unknown> {
-  const walls = (raw.walls as WallSeg[]) ?? [];
-  let windows = (raw.windows as Opening[]) ?? [];
-  let doors = (raw.doors as Opening[]) ?? [];
-  let fixtures = (raw.fixtures as Fixture[]) ?? [];
-  let rooms = (raw.rooms as RoomMeta[]) ?? [];
+  const walls = sanitizeWalls(raw.walls);
+  let windows = sanitizeOpenings(raw.windows, "window");
+  let doors = sanitizeOpenings(raw.doors, "door");
+  let fixtures = sanitizeFixtures(raw.fixtures);
+  let rooms = sanitizeRooms(raw.rooms);
 
   windows = expandMainGlassWindow(walls, windows);
   doors = enrichGlassWallOpenings(walls, windows, doors);
