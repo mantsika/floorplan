@@ -3,7 +3,6 @@
   "name": "floorplan-api",
   "account_id": "c1ac6faa0fcacb3cd335227a84c64699",
   "main": "src/worker.ts",
-  "pages_build_output_dir": "dist",
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat_v2"],
   "observability": {
