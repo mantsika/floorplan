@@ -1,0 +1,6 @@
+{
+  "name": "Image to Drawio Floorplan Converter",
+  "description": "Convert floorplan images, sketches, and documents into editable Draw.io diagrams and PDF blueprints with clear dimensions and interactive correction options.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

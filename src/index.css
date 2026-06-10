@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@layer utilities {
+  /* Architectural Blueprint Grid style */
+  .bg-blueprint {
+    background-color: #0d0e15; /* Elegant Deep Obsidian */
+    background-image: 
+      linear-gradient(rgba(99, 102, 241, 0.12) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(99, 102, 241, 0.12) 1px, transparent 1px),
+      linear-gradient(rgba(99, 102, 241, 0.04) 5px, transparent 5px),
+      linear-gradient(90deg, rgba(99, 102, 241, 0.04) 5px, transparent 5px);
+    background-size: 50px 50px, 50px 50px, 10px 10px, 10px 10px;
+    background-position: center;
+  }
+
+  .bg-blueprint-light {
+    background-color: #FAFAFC; /* Crisp Designer Paper White */
+    background-image: 
+      linear-gradient(rgba(99, 102, 241, 0.06) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(99, 102, 241, 0.06) 1px, transparent 1px),
+      linear-gradient(rgba(99, 102, 241, 0.02) 10px, transparent 10px),
+      linear-gradient(90deg, rgba(99, 102, 241, 0.02) 10px, transparent 10px);
+    background-size: 50px 50px, 50px 50px, 10px 10px, 10px 10px;
+    background-position: center;
+  }
+}
+
+@media print {
+  /* Printable landscape page rules */
+  @page {
+    size: A4 landscape;
+    margin: 0.5cm;
+  }
+  
+  body {
+    background: white !important;
+    color: black !important;
+    font-size: 11pt;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-only {
+    display: block !important;
+  }
+
+  /* Force light theme and fit nicely in A4 */
+  .print-blueprint-card {
+    border: 2px solid #000000 !important;
+    background: #ffffff !important;
+    box-shadow: none !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    height: auto !important;
+    margin: 0 !important;
+    padding: 10px !important;
+  }
+
+  .print-blueprint-svg {
+    background: #ffffff !important;
+    border: 1px solid #1e293b !important;
+    width: 100% !important;
+    height: auto !important;
+  }
+}
+
