@@ -10,5 +10,5 @@ npx wrangler d1 create floorplan-db 2>/dev/null || echo "D1 database may already
 echo ""
 echo "Copy the database_id from above into wrangler.jsonc under d1_databases[0].database_id"
 echo "Then run:"
-echo "  npx wrangler secret put GEMINI_API_KEY"
+echo "  npx wrangler secret put OPENROUTER_API_KEY"
 echo "  npm run deploy"

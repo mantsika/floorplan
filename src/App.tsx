@@ -52,6 +52,7 @@ import {
   WallType,
 } from "./types";
 import { templates } from "./templates";
+import { DEFAULT_EXTRACTION_MODEL, EXTRACTION_MODELS } from "./openRouterModels";
 import {
   WALL_ITEMS,
   DOOR_ITEMS,
@@ -118,6 +119,10 @@ export default function App() {
   const [showTracingImages, setShowTracingImages] = useState<boolean>(false);
   const [isConverting, setIsConverting] = useState<boolean>(false);
   const [additionalContext, setAdditionalContext] = useState<string>("");
+  const [selectedModel, setSelectedModel] = useState<string>(() => {
+    if (typeof window === "undefined") return DEFAULT_EXTRACTION_MODEL;
+    return localStorage.getItem("floorplan_ai_model") || DEFAULT_EXTRACTION_MODEL;
+  });
   const [apiError, setApiError] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
 
@@ -606,8 +611,8 @@ export default function App() {
     setApiError(null);
     setSuccessMessage(
       selectedBgObj
-        ? `Analyzing Lego block "${selectedBgObj.name}" with Gemini...`
-        : "Analyzing primary floorplan image with Gemini..."
+        ? `Analyzing block "${selectedBgObj.name}" with ${selectedModel}...`
+        : `Analyzing floorplan with ${selectedModel}...`
     );
 
     try {
@@ -618,6 +623,7 @@ export default function App() {
         body: JSON.stringify({
           image: imagePayload,
           additionalContext: additionalContext,
+          model: selectedModel,
         }),
       });
 
@@ -825,7 +831,7 @@ export default function App() {
       );
     } catch (err: any) {
       console.error(err);
-      triggerNotification(err.message || "Gemini could not parse this image. Let's calibrate or edit manually.", true);
+      triggerNotification(err.message || "AI could not parse this image. Try another model or edit manually.", true);
     } finally {
       setIsConverting(false);
     }
@@ -3322,6 +3328,27 @@ ${cellsXml}      </root>
               </div>
             );
           })()}
+
+          {/* AI model selector (OpenRouter) */}
+          <div className="mt-4 border-t border-slate-100 pt-4">
+            <label className="block text-[11px] font-bold text-slate-400 uppercase tracking-widest mb-2">
+              AI Model (OpenRouter)
+            </label>
+            <select
+              value={selectedModel}
+              onChange={(e) => {
+                setSelectedModel(e.target.value);
+                localStorage.setItem("floorplan_ai_model", e.target.value);
+              }}
+              className="w-full text-xs px-3 py-2 bg-white rounded-lg border border-slate-200 focus:outline-none focus:border-indigo-500 text-slate-800"
+            >
+              {EXTRACTION_MODELS.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label} ({m.provider}) — {m.description}
+                </option>
+              ))}
+            </select>
+          </div>
 
           {/* Additional context parameter */}
           <div className="mt-4 border-t border-slate-100 pt-4">

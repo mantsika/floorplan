@@ -8,7 +8,7 @@ The app **cannot upload to R2 or use D1** until Cloudflare is set up. R2 and D1 
 |----------|---------------------|-------------|
 | **R2** bucket `floorplan` | `wrangler.jsonc` → `r2_buckets` binding `BUCKET` | `npx wrangler r2 bucket create floorplan` |
 | **D1** database `floorplan-db` | `wrangler.jsonc` → `d1_databases` binding `DB` | `npx wrangler d1 create floorplan-db` then paste `database_id` into `wrangler.jsonc` |
-| **Gemini AI** | Worker secret | `npx wrangler secret put GEMINI_API_KEY` |
+| **OpenRouter AI** | Worker secret | `npx wrangler secret put OPENROUTER_API_KEY` |
 | **Frontend API URL** | `VITE_API_URL` in `.env.production` or GitHub secret | Worker URL after deploy, e.g. `https://floorplan-api.<account>.workers.dev` |
 | **Cloudflare auth** | GitHub Actions secrets or `wrangler login` | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID` |
 
@@ -31,8 +31,8 @@ npx wrangler r2 bucket create floorplan
 # 2. Create D1 — copy database_id into wrangler.jsonc
 npx wrangler d1 create floorplan-db
 
-# 3. Set Gemini secret on the Worker (must start with AIzaSy)
-npx wrangler secret put GEMINI_API_KEY
+# 3. Set OpenRouter secret on the Worker (from https://openrouter.ai/keys)
+npx wrangler secret put OPENROUTER_API_KEY
 
 # 4. Deploy API + run migrations
 npm run deploy:api
@@ -50,7 +50,7 @@ Add these at **github.com/mantsika/floorplan → Settings → Secrets**:
 |--------|-------|
 | `CLOUDFLARE_API_TOKEN` | API token with Workers + R2 + D1 + Pages edit |
 | `CLOUDFLARE_ACCOUNT_ID` | From Cloudflare dashboard sidebar |
-| `GEMINI_API_KEY` | `AIzaSy...` from https://aistudio.google.com/apikey |
+| `OPENROUTER_API_KEY` | `sk-or-...` from https://openrouter.ai/keys |
 | `VITE_API_URL` | `https://floorplan-api.<account>.workers.dev` |
 
 ## Why uploads don't work locally right now
@@ -84,4 +84,4 @@ VITE_API_URL=http://localhost:8787
 curl https://floorplan-api.YOUR_SUBDOMAIN.workers.dev/api/health
 ```
 
-Expected: `{ "status": "ok", "d1Connected": true, "geminiKeyFormatValid": true }`
+Expected: `{ "status": "ok", "d1Connected": true, "openRouterKeyConfigured": true, "provider": "openrouter" }`

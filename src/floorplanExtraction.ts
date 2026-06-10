@@ -1,3 +1,5 @@
+import { DEFAULT_EXTRACTION_MODEL, resolveModelId } from "./openRouterModels";
+
 export const FLOORPLAN_RESPONSE_SCHEMA = {
   type: "object",
   properties: {
@@ -83,22 +85,19 @@ export const FLOORPLAN_RESPONSE_SCHEMA = {
 } as const;
 
 const SYSTEM_INSTRUCTION = `You are a precision architectural floorplan digitization engine.
-Your task is to trace every visible architectural element from the uploaded floorplan image into structured vector coordinates with maximum geometric fidelity.
+Trace every visible element from the floorplan image into structured vector coordinates with maximum geometric fidelity.
 
-COORDINATE SYSTEM:
-- Use a 0–1000 grid for both X and Y, mapping to the image bounding box.
-- (0,0) is top-left; (1000,1000) is bottom-right.
-- All coordinates must be integers.
-- Snap nearly-aligned walls (within ~3 units) to exact horizontal/vertical alignment.
-- Wall segment endpoints that meet at corners MUST share identical coordinates.
-
+COORDINATE SYSTEM: 0–1000 grid, (0,0) top-left. Integer coordinates only.
 WALL TYPES: exterior, interior, partition, double
 DOOR TYPES: hinged, sliding, folding, pocket, double
 WINDOW TYPES: fixed, sliding, casement, bay
 
-ANTI-HALLUCINATION: Extract ONLY elements explicitly drawn in the image.`;
+ANTI-HALLUCINATION: Extract ONLY elements explicitly drawn. Do not invent rooms or walls.
 
-export function parseImagePayload(image: string): { base64Data: string; mimeType: string } {
+Respond with valid JSON only matching this schema:
+${JSON.stringify(FLOORPLAN_RESPONSE_SCHEMA)}`;
+
+export function parseImagePayload(image: string): { base64Data: string; mimeType: string; dataUrl: string } {
   let base64Data = image;
   let mimeType = "image/jpeg";
   if (image.includes(";base64,")) {
@@ -106,81 +105,90 @@ export function parseImagePayload(image: string): { base64Data: string; mimeType
     mimeType = parts[0].replace("data:", "");
     base64Data = parts[1];
   }
-  return { base64Data, mimeType };
+  return { base64Data, mimeType, dataUrl: `data:${mimeType};base64,${base64Data}` };
 }
 
-export function validateApiKey(apiKey: string | undefined): string {
+export function validateOpenRouterApiKey(apiKey: string | undefined): string {
   const key = apiKey?.trim();
-  if (!key || key === "MY_GEMINI_API_KEY") {
+  if (!key || key === "MY_OPENROUTER_API_KEY") {
     throw new Error(
-      "GEMINI_API_KEY is not set. Create a key at https://aistudio.google.com/apikey"
-    );
-  }
-  if (!key.startsWith("AIza")) {
-    throw new Error(
-      "GEMINI_API_KEY format is invalid. Use a key from https://aistudio.google.com/apikey (starts with AIzaSy)."
+      "OPENROUTER_API_KEY is not set. Create a key at https://openrouter.ai/keys"
     );
   }
   return key;
 }
 
+export interface ExtractionOptions {
+  additionalContext?: string;
+  model?: string;
+  defaultModel?: string;
+}
+
 export async function extractFloorplanFromImage(
   apiKey: string,
   image: string,
-  additionalContext?: string
+  options: ExtractionOptions = {}
 ): Promise<Record<string, unknown>> {
-  const { base64Data, mimeType } = parseImagePayload(image);
+  const { base64Data, mimeType, dataUrl } = parseImagePayload(image);
+  const model = resolveModelId(options.model, options.defaultModel ?? DEFAULT_EXTRACTION_MODEL);
 
   const promptText = `Digitize this floorplan image with precision architectural tracing.
 
 Extract ALL visible elements:
 1. walls — every wall segment with (x1,y1,x2,y2) and type (exterior|interior|partition|double)
-2. doors — center anchor (x,y), width, orientation (h|v), swing (n|s|e|w), doorType (hinged|sliding|folding|pocket|double)
-3. windows — center (x,y), width, orientation (h|v), windowType (fixed|sliding|casement|bay)
+2. doors — center anchor (x,y), width, orientation (h|v), swing (n|s|e|w), doorType
+3. windows — center (x,y), width, orientation (h|v), windowType
 4. rooms — name, label center (x,y), estimatedAreaM2 if inferable
-5. fixtures — fixed plan-view elements: type, center (x,y), width, height, rotation (degrees), optional label
+5. fixtures — type, center (x,y), width, height, rotation, optional label
 
-User context: ${additionalContext || "None"}
+User context: ${options.additionalContext || "None"}
 
 Return integer coordinates 0–1000. Ensure wall junctions connect cleanly.`;
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
-        contents: [
-          {
-            role: "user",
-            parts: [
-              { inline_data: { mime_type: mimeType, data: base64Data } },
-              { text: promptText },
-            ],
-          },
-        ],
-        generationConfig: {
-          responseMimeType: "application/json",
-          responseSchema: FLOORPLAN_RESPONSE_SCHEMA,
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://floorplan-a6a.pages.dev",
+      "X-Title": "FloorPlan.ai",
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: "system", content: SYSTEM_INSTRUCTION },
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: dataUrl } },
+            { type: "text", text: promptText },
+          ],
         },
-      }),
-    }
-  );
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0.1,
+    }),
+  });
 
   if (!response.ok) {
     const errText = await response.text();
-    throw new Error(errText || `Gemini API error ${response.status}`);
+    throw new Error(errText || `OpenRouter API error ${response.status}`);
   }
 
   const result = (await response.json()) as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    choices?: Array<{ message?: { content?: string } }>;
+    error?: { message?: string };
   };
 
-  const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (!text) {
-    throw new Error("No response from Gemini model");
+  if (result.error?.message) {
+    throw new Error(result.error.message);
   }
 
-  return JSON.parse(text) as Record<string, unknown>;
+  const text = result.choices?.[0]?.message?.content;
+  if (!text) {
+    throw new Error(`No response from model ${model}`);
+  }
+
+  const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
+  return JSON.parse(cleaned) as Record<string, unknown>;
 }

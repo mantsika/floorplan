@@ -1,12 +1,14 @@
 import {
   extractFloorplanFromImage,
-  validateApiKey,
+  validateOpenRouterApiKey,
 } from "./floorplanExtraction";
+import { DEFAULT_EXTRACTION_MODEL, EXTRACTION_MODELS } from "./openRouterModels";
 
 export interface Env {
   BUCKET: R2Bucket;
   DB: D1Database;
-  GEMINI_API_KEY: string;
+  OPENROUTER_API_KEY: string;
+  DEFAULT_EXTRACTION_MODEL?: string;
   PAGES_ORIGIN?: string;
 }
 
@@ -69,13 +71,14 @@ async function handleHealth(env: Env): Promise<Response> {
     d1Ok = false;
   }
 
-  const key = env.GEMINI_API_KEY?.trim();
+  const key = env.OPENROUTER_API_KEY?.trim();
   return json({
     status: "ok",
     time: new Date().toISOString(),
     d1Connected: d1Ok,
-    geminiKeyConfigured: Boolean(key && key !== "MY_GEMINI_API_KEY"),
-    geminiKeyFormatValid: Boolean(key?.startsWith("AIza")),
+    openRouterKeyConfigured: Boolean(key && key !== "MY_OPENROUTER_API_KEY"),
+    defaultModel: env.DEFAULT_EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL,
+    provider: "openrouter",
   });
 }
 
@@ -322,30 +325,51 @@ async function handleSaveFloorplan(request: Request, env: Env, cors: HeadersInit
 
 async function handleConvert(request: Request, env: Env, cors: HeadersInit): Promise<Response> {
   try {
-    const body = (await request.json()) as { image?: string; additionalContext?: string };
+    const body = (await request.json()) as {
+      image?: string;
+      additionalContext?: string;
+      model?: string;
+    };
     if (!body.image) {
       return json({ error: "Missing image in request body" }, 400, cors);
     }
 
-    const apiKey = validateApiKey(env.GEMINI_API_KEY);
-    const parsed = await extractFloorplanFromImage(apiKey, body.image, body.additionalContext);
+    const apiKey = validateOpenRouterApiKey(env.OPENROUTER_API_KEY);
+    const parsed = await extractFloorplanFromImage(apiKey, body.image, {
+      additionalContext: body.additionalContext,
+      model: body.model,
+      defaultModel: env.DEFAULT_EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL,
+    });
     return json(parsed, 200, cors);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Conversion failed";
     const isAuthError =
-      message.includes("API key not valid") ||
-      message.includes("API_KEY_INVALID") ||
-      message.includes("GEMINI_API_KEY");
+      message.includes("401") ||
+      message.includes("User not found") ||
+      message.includes("OPENROUTER_API_KEY") ||
+      message.includes("Invalid API key");
     return json(
       {
         error: isAuthError
-          ? "Invalid Gemini API key. Set GEMINI_API_KEY via wrangler secret put GEMINI_API_KEY"
+          ? "Invalid OpenRouter API key. Set OPENROUTER_API_KEY via wrangler secret put OPENROUTER_API_KEY"
           : message,
       },
       isAuthError ? 401 : 500,
       cors
     );
   }
+}
+
+function handleListModels(env: Env, cors: HeadersInit): Response {
+  return json(
+    {
+      provider: "openrouter",
+      defaultModel: env.DEFAULT_EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL,
+      models: EXTRACTION_MODELS,
+    },
+    200,
+    cors
+  );
 }
 
 export default {
@@ -391,6 +415,10 @@ export default {
     const floorplanMatch = url.pathname.match(/^\/api\/floorplans\/([^/]+)$/);
     if (floorplanMatch && request.method === "GET") {
       return handleGetFloorplan(floorplanMatch[1], env, cors);
+    }
+
+    if (url.pathname === "/api/models" && request.method === "GET") {
+      return handleListModels(env, cors);
     }
 
     if (url.pathname === "/api/convert-floorplan" && request.method === "POST") {

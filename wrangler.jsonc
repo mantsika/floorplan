@@ -9,7 +9,8 @@
     "enabled": true
   },
   "vars": {
-    "PAGES_ORIGIN": "*"
+    "PAGES_ORIGIN": "*",
+    "DEFAULT_EXTRACTION_MODEL": "google/gemini-2.5-flash"
   },
   "r2_buckets": [
     {
