@@ -3824,6 +3824,24 @@ ${cellsXml}      </root>
                             </g>
                           );
                         }
+                        case "fireplace": {
+                          return (
+                            <g>
+                              <rect x={-halfW} y={-halfH} width={fixture.width} height={fixture.height} fill={fillCol} stroke={strokeCol} strokeWidth="2.5" rx="2" />
+                              <rect x={-halfW + 8} y={-halfH + 8} width={fixture.width - 16} height={fixture.height - 16} fill="none" stroke={strokeCol} strokeWidth="1.5" rx="1" />
+                              <path d={`M ${-halfW + 12} ${halfH - 8} Q 0 ${-halfH + 6} ${halfW - 12} ${halfH - 8}`} fill="none" stroke="#F97316" strokeWidth="2" />
+                            </g>
+                          );
+                        }
+                        case "light_fitting": {
+                          return (
+                            <g>
+                              <circle cx={0} cy={0} r={Math.min(halfW, halfH)} fill={fillCol} stroke={strokeCol} strokeWidth="2" />
+                              <line x1={0} y1={-Math.min(halfW, halfH)} x2={0} y2={Math.min(halfW, halfH)} stroke={strokeCol} strokeWidth="1.5" />
+                              <line x1={-Math.min(halfW, halfH)} y1={0} x2={Math.min(halfW, halfH)} y2={0} stroke={strokeCol} strokeWidth="1.5" />
+                            </g>
+                          );
+                        }
                         case "balcony":
                         case "patio": {
                           return (

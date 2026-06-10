@@ -4,6 +4,8 @@ import {
   extractFloorplanViaGemini,
   extractMissedItemsViaGemini,
   resolveExtractionCredentials,
+  formatAiErrorMessage,
+  isAiOverloadError,
 } from "./floorplanExtraction";
 import { DEFAULT_EXTRACTION_MODEL, EXTRACTION_MODELS } from "./openRouterModels";
 
@@ -399,13 +401,14 @@ async function handleConvert(request: Request, env: Env, cors: HeadersInit): Pro
       message.includes("No AI API key") ||
       message.includes("Invalid API key") ||
       message.includes("API key not valid");
+    const isOverload = isAiOverloadError(message);
     return json(
       {
         error: isAuthError
           ? "AI API key missing or invalid. Set OPENROUTER_API_KEY or GEMINI_API_KEY on the Worker (wrangler secret put)."
-          : message,
+          : formatAiErrorMessage(message),
       },
-      isAuthError ? 401 : 500,
+      isAuthError ? 401 : isOverload ? 503 : 500,
       cors
     );
   }

@@ -109,15 +109,14 @@ function sanitizeOpenings(rawItems: unknown, prefix: string): Opening[] {
 }
 
 const MIN_FIXTURE_SIZE: Record<string, { w: number; h: number }> = {
-  sofa: { w: 80, h: 36 },
-  bed: { w: 100, h: 80 },
-  table: { w: 44, h: 44 },
   cabinet: { w: 40, h: 28 },
   wall_cabinet: { w: 40, h: 20 },
   counter: { w: 48, h: 24 },
   island: { w: 60, h: 40 },
   stove: { w: 36, h: 36 },
   sink: { w: 32, h: 28 },
+  fireplace: { w: 48, h: 32 },
+  light_fitting: { w: 20, h: 20 },
   fridge: { w: 36, h: 40 },
   toilet: { w: 28, h: 40 },
   bathtub: { w: 60, h: 32 },
@@ -131,7 +130,7 @@ function sanitizeFixtures(rawFixtures: unknown): Fixture[] {
     .map((item, index) => {
       if (!item || typeof item !== "object") return null;
       const raw = item as Record<string, unknown>;
-      const type = normalizeFixtureType(typeof raw.type === "string" ? raw.type : "table");
+      const type = normalizeFixtureType(typeof raw.type === "string" ? raw.type : "unknown");
       const mins = MIN_FIXTURE_SIZE[type] ?? { w: 20, h: 20 };
       const x = toInt(raw.x, NaN);
       const y = toInt(raw.y, NaN);
@@ -209,6 +208,36 @@ function wallBbox(walls: WallSeg[]) {
   };
 }
 
+/** Fixture types kept from AI extraction — no movable furniture */
+export const ARCHITECTURAL_FIXTURE_TYPES = new Set([
+  "cabinet",
+  "wall_cabinet",
+  "counter",
+  "island",
+  "fireplace",
+  "light_fitting",
+  "stove",
+  "sink",
+  "fridge",
+  "dishwasher",
+  "washing_machine",
+  "toilet",
+  "bathtub",
+  "shower",
+  "staircase",
+  "column",
+  "balcony",
+  "patio",
+]);
+
+export function isArchitecturalFixtureType(type: string): boolean {
+  return ARCHITECTURAL_FIXTURE_TYPES.has(type);
+}
+
+export function filterArchitecturalFixtures<T extends { type: string }>(fixtures: T[]): T[] {
+  return fixtures.filter((f) => isArchitecturalFixtureType(f.type));
+}
+
 export function normalizeFixtureType(raw: string): string {
   const t = raw.toLowerCase().replace(/[\s-]+/g, "_");
   if (["wall_cabinet", "upper_cabinet", "overhead"].some((k) => t.includes(k))) return "wall_cabinet";
@@ -216,19 +245,28 @@ export function normalizeFixtureType(raw: string): string {
   if (t.includes("cabinet") || t.includes("cupboard")) return "cabinet";
   if (["counter", "countertop", "worktop", "benchtop"].some((k) => t.includes(k))) return "counter";
   if (t.includes("island") || t.includes("peninsula")) return "island";
+  if (["fireplace", "hearth", "wood_burner"].some((k) => t.includes(k))) return "fireplace";
+  if (
+    ["light_fitting", "light_fixture", "ceiling_light", "pendant", "chandelier", "downlight", "spotlight", "recessed"].some(
+      (k) => t.includes(k)
+    )
+  ) {
+    return "light_fitting";
+  }
   if (["fridge", "refrigerator", "freezer"].some((k) => t.includes(k))) return "fridge";
   if (["dishwasher", "dish_washer"].some((k) => t.includes(k))) return "dishwasher";
   if (["washing_machine", "washer", "laundry"].some((k) => t.includes(k))) return "washing_machine";
   if (["oven", "cooktop", "hob", "range"].some((k) => t.includes(k))) return "stove";
-  if (["sofa", "couch", "sectional", "loveseat"].some((k) => t.includes(k))) return "sofa";
-  if (["armchair", "chair", "recliner"].some((k) => t.includes(k))) return "sofa";
-  if (["coffee_table", "side_table", "table", "desk"].some((k) => t.includes(k))) return "table";
-  if (["tv", "television", "monitor"].some((k) => t.includes(k))) return "table";
-  if (["bed", "mattress"].some((k) => t.includes(k))) return "bed";
-  if (["lamp", "floor_lamp"].some((k) => t.includes(k))) return "table";
-  if (["heater", "radiator", "shelf", "dresser", "vanity"].some((k) => t.includes(k))) return "cabinet";
+  if (["vanity", "dresser"].some((k) => t.includes(k))) return "cabinet";
+  if (["radiator", "heater"].some((k) => t.includes(k))) return "column";
   if (["balcony", "terrace", "patio", "deck"].some((k) => t.includes(k))) return t.includes("patio") ? "patio" : "balcony";
   if (["toilet", "bathtub", "shower", "sink", "stove", "staircase", "column"].includes(t)) return t;
+  if (["lamp", "light", "lighting"].some((k) => t.includes(k))) return "light_fitting";
+  // Movable furniture — normalized for filtering, never kept in extraction output
+  if (["sofa", "couch", "sectional", "loveseat", "armchair", "chair", "recliner"].some((k) => t.includes(k))) return "sofa";
+  if (["coffee_table", "side_table", "table", "desk"].some((k) => t.includes(k))) return "table";
+  if (["tv", "television", "monitor", "rug", "carpet"].some((k) => t.includes(k))) return "table";
+  if (["bed", "mattress"].some((k) => t.includes(k))) return "bed";
   return "table";
 }
 
@@ -362,14 +400,6 @@ function scaleFixturesToRoom(fixtures: Fixture[], walls: WallSeg[]): Fixture[] {
       : roomH * 0.12;
     let width = Math.min(f.width, maxW);
     let height = Math.min(f.height, maxH);
-    if (type === "table" && (f.type.includes("lamp") || f.label?.toLowerCase().includes("lamp"))) {
-      width = Math.min(width, 35);
-      height = Math.min(height, 35);
-    }
-    if (f.type.includes("tv") || f.label?.toLowerCase().includes("tv")) {
-      width = Math.min(width, roomW * 0.08);
-      height = Math.min(height, 12);
-    }
     const x = Math.max(box.minX + width / 2, Math.min(box.maxX - width / 2, f.x));
     const y = Math.max(box.minY + height / 2, Math.min(box.maxY - height / 2, f.y));
     const rotation = normalizeFixtureRotation(f.rotation);
@@ -377,10 +407,6 @@ function scaleFixturesToRoom(fixtures: Fixture[], walls: WallSeg[]): Fixture[] {
     const mins = MIN_FIXTURE_SIZE[type] ?? { w: 20, h: 20 };
     let w = Math.max(mins.w, Math.round(width));
     let h = Math.max(mins.h, Math.round(height));
-    if ((type === "sofa" || type === "bed") && h > w) {
-      [w, h] = [h, w];
-      return { ...f, type, width: w, height: h, x: Math.round(x), y: Math.round(y), rotation: (rotation + 90) % 360 };
-    }
     return { ...f, type, width: w, height: h, x: Math.round(x), y: Math.round(y), rotation };
   });
 }
@@ -423,7 +449,7 @@ export function postProcessExtraction(raw: Record<string, unknown>): Record<stri
 
   windows = expandMainGlassWindow(walls, windows);
   doors = enrichGlassWallOpenings(walls, windows, doors);
-  fixtures = scaleFixturesToRoom(fixtures, walls);
+  fixtures = filterArchitecturalFixtures(scaleFixturesToRoom(fixtures, walls));
   rooms = normalizeRoomDimensions(walls, rooms);
 
   return { ...raw, walls, windows, doors, fixtures, rooms };

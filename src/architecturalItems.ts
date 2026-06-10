@@ -50,6 +50,8 @@ export const FIXTURE_ITEMS: ArchitecturalItemDef[] = [
   { id: "dishwasher", category: "fixtures", label: "Dishwasher", icon: "🫧", description: "Dishwasher", defaultWidth: 40, defaultHeight: 45 },
   { id: "washing_machine", category: "fixtures", label: "Washer", icon: "🧺", description: "Washing machine", defaultWidth: 40, defaultHeight: 45 },
   { id: "column", category: "fixtures", label: "Structural Column", icon: "⬛", description: "Load-bearing column", defaultWidth: 24, defaultHeight: 24 },
+  { id: "fireplace", category: "fixtures", label: "Fireplace", icon: "🔥", description: "Built-in fireplace or hearth", defaultWidth: 60, defaultHeight: 40 },
+  { id: "light_fitting", category: "fixtures", label: "Light Fitting", icon: "💡", description: "Ceiling or wall light symbol", defaultWidth: 24, defaultHeight: 24 },
   { id: "balcony", category: "fixtures", label: "Balcony / Terrace", icon: "🌿", description: "External balcony or terrace space", defaultWidth: 90, defaultHeight: 55 },
   { id: "patio", category: "fixtures", label: "Patio / Deck", icon: "☀️", description: "Ground-level patio or deck", defaultWidth: 100, defaultHeight: 60 },
 ];

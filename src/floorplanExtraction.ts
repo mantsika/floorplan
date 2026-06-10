@@ -123,23 +123,22 @@ ROOMS:
 - Name the room (Living Room, Kitchen, etc.).
 - REQUIRED: estimatedWidthM, estimatedDepthM, estimatedAreaM2 — each room gets different values based on the actual space.
 
-FIXTURES — exhaustive extraction from the photo (do NOT cluster at center):
-- LIVING ROOMS: sofa, sectional, armchairs, coffee table, TV unit, side tables, rug, floor lamp.
-- KITCHENS (critical — extract ALL visible built-ins):
-  * Base cabinet runs along walls (type "cabinet", long rectangles 150–350 wide × 40–60 deep)
-  * Wall/upper cabinets (type "wall_cabinet", along same walls, narrower depth 25–35)
-  * Countertop runs (type "counter")
-  * Island or peninsula if present (type "island")
-  * Appliances: sink, stove, fridge, dishwasher, washing_machine — each as separate fixture
-  * Minimum 8 fixtures for kitchens with visible cabinetry
-- BATHROOMS: toilet, sink, shower/bathtub, vanity cabinet
-- POSITION: map each item's real floor location from the photo into the 0–1000 plan. Camera at bottom of image → furniture in the foreground sits in the lower half of the plan (higher y). Items against the far/glass wall sit near the top (lower y).
-- ORIENTATION (rotation, degrees, top-down): 0 = long axis horizontal with back toward top/north; 90 = long axis vertical, back toward left/west; 180/270 likewise. Sofas: width is the long seating edge, height is depth; rotate so the backrest faces the wall behind it in the photo.
-- SIZE: sofa 160–240 × 75–100; coffee table 70–120 × 45–70; bed 140–200 × 180–220. Use integers.
-- Return at least all large furniture visible — empty fixtures array is wrong when sofa/table are clearly visible.
+FIXTURES — ARCHITECTURAL / BUILT-IN ONLY (never movable furniture):
+- INCLUDE: cabinet, wall_cabinet, counter, island, fireplace, light_fitting, built-in appliances (sink, stove, fridge, dishwasher, washing_machine), toilet, bathtub, shower, staircase, column, balcony, patio
+- EXCLUDE: sofas, beds, tables, chairs, armchairs, rugs, TV units, floor lamps, decorative movable items — do NOT return these
+- KITCHENS: extract ALL visible built-in runs — base cabinets along walls (type "cabinet"), wall_cabinet, counter, island, and fixed appliances
+- BATHROOMS: toilet, sink, shower/bathtub, vanity cabinet (type "cabinet")
+- LIVING ROOMS: only built-ins — fireplace, light_fitting, fixed cabinetry; empty fixtures[] is correct when no built-ins are visible
+- POSITION: map each built-in to its real wall/floor location on the 0–1000 plan
+- ORIENTATION (rotation, degrees): 0 = long axis horizontal; 90/180/270 for wall-aligned built-ins
 
 Respond with valid JSON only matching this schema:
 ${JSON.stringify(FLOORPLAN_RESPONSE_SCHEMA)}`;
+
+const FIXTURE_EXTRACTION_PROMPT = `5. fixtures — ARCHITECTURAL / BUILT-IN ONLY:
+   - INCLUDE: cabinet, wall_cabinet, counter, island, fireplace, light_fitting, sink, stove, fridge, dishwasher, washing_machine, toilet, bathtub, shower, staircase, column, balcony, patio
+   - EXCLUDE all movable furniture (sofas, beds, tables, chairs, rugs, TV units, lamps)
+   - Empty fixtures[] is OK for rooms with no built-ins`;
 
 export function parseImagePayload(image: string): { base64Data: string; mimeType: string; dataUrl: string } {
   let base64Data = image;
@@ -195,6 +194,44 @@ export function resolveGeminiModelId(openRouterModelId: string): string {
   return "gemini-2.5-flash";
 }
 
+const GEMINI_FALLBACK_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.0-flash",
+  "gemini-2.0-flash-001",
+  "gemini-2.0-flash-lite",
+];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function isAiOverloadError(message: string): boolean {
+  return /503|429|UNAVAILABLE|high demand|RESOURCE_EXHAUSTED|overloaded|rate limit/i.test(message);
+}
+
+export function formatAiErrorMessage(message: string): string {
+  let text = message;
+  try {
+    const outer = JSON.parse(message) as { error?: { message?: string } };
+    if (outer.error?.message) text = outer.error.message;
+  } catch {
+    // use raw message
+  }
+  if (isAiOverloadError(text)) {
+    return "AI model is temporarily busy. Wait a moment and try again, or pick another model in Settings.";
+  }
+  return text.length > 280 ? `${text.slice(0, 280)}…` : text;
+}
+
+function isRetryableGeminiError(message: string): boolean {
+  return isAiOverloadError(message);
+}
+
+function geminiModelCandidates(requestedModel: string): string[] {
+  const models = [requestedModel, ...GEMINI_FALLBACK_MODELS.filter((m) => m !== requestedModel)];
+  return [...new Set(models)];
+}
+
 async function callGeminiJson(
   apiKey: string,
   model: string,
@@ -244,7 +281,42 @@ async function callGeminiJson(
   }
 
   const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
-  return JSON.parse(cleaned) as Record<string, unknown>;
+  try {
+    return JSON.parse(cleaned) as Record<string, unknown>;
+  } catch {
+    throw new Error(`Gemini returned invalid JSON from model ${model}`);
+  }
+}
+
+async function callGeminiJsonWithFallback(
+  apiKey: string,
+  requestedModel: string,
+  promptText: string,
+  image: { base64Data: string; mimeType: string },
+  maxOutputTokens: number
+): Promise<Record<string, unknown>> {
+  const models = geminiModelCandidates(requestedModel);
+  let lastError = "Gemini extraction failed";
+
+  for (const model of models) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await callGeminiJson(apiKey, model, promptText, image, maxOutputTokens);
+      } catch (error: unknown) {
+        lastError = error instanceof Error ? error.message : lastError;
+        if (isRetryableGeminiError(lastError)) {
+          if (attempt === 0) {
+            await sleep(1200);
+            continue;
+          }
+          break;
+        }
+        throw error instanceof Error ? error : new Error(lastError);
+      }
+    }
+  }
+
+  throw new Error(formatAiErrorMessage(lastError));
 }
 
 export interface HighlightRegion {
@@ -312,10 +384,7 @@ Requirements:
 2. windows — ALL glass visible. orientation: "h" or "v" only
 3. doors — any operable panel. orientation: "h" or "v". swing: "n"/"s"/"e"/"w"
 4. rooms — name + estimatedWidthM + estimatedDepthM + estimatedAreaM2 (all required, unique per room)
-5. fixtures — EVERY visible item including kitchen cabinets/counters/appliances; accurate x, y, width, height, rotation
-
-Kitchen photos: return cabinet runs along walls, not just stove/sink.
-The fixtures array must NOT be empty when furniture or cabinetry is visible.`;
+${FIXTURE_EXTRACTION_PROMPT}`;
 
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -393,8 +462,9 @@ User hints: ${userHints}
 Highlighted regions (0–1000 coords, top-left origin):
 ${regionsText}
 
-Return ONLY doors, windows, and fixtures that belong inside these highlighted regions.
-- Do NOT return walls or rooms.
+Return ONLY doors, windows, and architectural fixtures inside these highlighted regions.
+- Do NOT return walls, rooms, or movable furniture (sofas, beds, tables, chairs).
+- Built-in fixtures only: cabinets, counters, appliances, fireplace, light_fitting, etc.
 - Use the same 0–1000 coordinate system as the full extraction.
 - orientation: "h" or "v" only. swing: "n"|"s"|"e"|"w" for doors.
 - If a region marks a side door beside glass, return a sliding door with correct width and position.
@@ -484,12 +554,9 @@ Requirements:
 2. windows — ALL glass visible. orientation: "h" or "v" only
 3. doors — any operable panel. orientation: "h" or "v". swing: "n"/"s"/"e"/"w"
 4. rooms — name + estimatedWidthM + estimatedDepthM + estimatedAreaM2 (all required, unique per room)
-5. fixtures — EVERY visible item including kitchen cabinets/counters/appliances; accurate x, y, width, height, rotation
+${FIXTURE_EXTRACTION_PROMPT}`;
 
-Kitchen photos: return cabinet runs along walls, not just stove/sink.
-The fixtures array must NOT be empty when furniture or cabinetry is visible.`;
-
-  const parsed = await callGeminiJson(apiKey, model, promptText, imagePayload, 8192);
+  const parsed = await callGeminiJsonWithFallback(apiKey, model, promptText, imagePayload, 8192);
   return postProcessExtraction(parsed);
 }
 
@@ -520,8 +587,9 @@ User hints: ${userHints}
 Highlighted regions (0–1000 coords, top-left origin):
 ${regionsText}
 
-Return ONLY doors, windows, and fixtures that belong inside these highlighted regions.
-- Do NOT return walls or rooms.
+Return ONLY doors, windows, and architectural fixtures inside these highlighted regions.
+- Do NOT return walls, rooms, or movable furniture (sofas, beds, tables, chairs).
+- Built-in fixtures only: cabinets, counters, appliances, fireplace, light_fitting, etc.
 - Use the same 0–1000 coordinate system as the full extraction.
 - orientation: "h" or "v" only. swing: "n"|"s"|"e"|"w" for doors.
 - If a region marks a side door beside glass, return a sliding door with correct width and position.
@@ -530,7 +598,7 @@ Return ONLY doors, windows, and fixtures that belong inside these highlighted re
 Respond with valid JSON only:
 ${JSON.stringify(MISSED_ITEMS_SCHEMA)}`;
 
-  const parsed = await callGeminiJson(apiKey, model, promptText, imagePayload, 4096);
+  const parsed = await callGeminiJsonWithFallback(apiKey, model, promptText, imagePayload, 4096);
   return postProcessExtraction({
     walls: [],
     rooms: [],
