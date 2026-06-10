@@ -13,7 +13,7 @@
     "lint": "tsc --noEmit",
     "db:migrate": "wrangler d1 migrations apply floorplan-db --remote",
     "deploy:api": "wrangler d1 migrations apply floorplan-db --remote && wrangler deploy",
-    "deploy:pages": "npm run build && wrangler pages deploy dist --project-name=floorplan",
+    "deploy:pages": "VITE_API_URL=${VITE_API_URL:-https://floorplan-api.mantsika.workers.dev} npm run build && wrangler pages deploy dist --project-name=floorplan",
     "deploy": "npm run deploy:api && npm run deploy:pages",
     "cf:types": "wrangler types"
   },

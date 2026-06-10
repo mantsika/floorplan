@@ -1,6 +1,23 @@
 import { UserSession, getUserSession } from "./userId";
 
-const API_BASE = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "") ?? "";
+/** Production Worker — used when VITE_API_URL was not baked in at build time */
+const PRODUCTION_WORKER_API = "https://floorplan-api.mantsika.workers.dev";
+
+function resolveApiBase(): string {
+  const fromEnv = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "");
+  if (fromEnv) return fromEnv;
+
+  if (typeof window !== "undefined") {
+    const host = window.location.hostname;
+    if (host.endsWith(".pages.dev") || host === "floorplan-a6a.pages.dev") {
+      return PRODUCTION_WORKER_API;
+    }
+  }
+
+  return "";
+}
+
+const API_BASE = resolveApiBase();
 
 export function apiUrl(path: string): string {
   return `${API_BASE}${path}`;

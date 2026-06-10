@@ -59,7 +59,7 @@ jobs:
       - name: Build frontend
         run: npm run build
         env:
-          VITE_API_URL: ${{ secrets.VITE_API_URL }}
+          VITE_API_URL: ${{ secrets.VITE_API_URL || 'https://floorplan-api.mantsika.workers.dev' }}
 
       - name: Deploy to Cloudflare Pages
         run: npx wrangler pages deploy dist --project-name=${{ env.PAGES_PROJECT }} --commit-dirty=true
