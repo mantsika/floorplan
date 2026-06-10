@@ -1,7 +1,9 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "floorplan-api",
+  "account_id": "c1ac6faa0fcacb3cd335227a84c64699",
   "main": "src/worker.ts",
+  "pages_build_output_dir": "dist",
   "compatibility_date": "2025-06-01",
   "compatibility_flags": ["nodejs_compat_v2"],
   "observability": {
@@ -20,7 +22,7 @@
     {
       "binding": "DB",
       "database_name": "floorplan-db",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "61f3c5e9-a484-4cc2-b077-0eb91b188439",
       "migrations_dir": "migrations"
     }
   ]
