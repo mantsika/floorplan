@@ -1,14 +1,17 @@
 import {
   extractFloorplanFromImage,
   extractMissedItemsFromImage,
-  validateOpenRouterApiKey,
+  extractFloorplanViaGemini,
+  extractMissedItemsViaGemini,
+  resolveExtractionCredentials,
 } from "./floorplanExtraction";
 import { DEFAULT_EXTRACTION_MODEL, EXTRACTION_MODELS } from "./openRouterModels";
 
 export interface Env {
   BUCKET: R2Bucket;
   DB: D1Database;
-  OPENROUTER_API_KEY: string;
+  OPENROUTER_API_KEY?: string;
+  GEMINI_API_KEY?: string;
   DEFAULT_EXTRACTION_MODEL?: string;
   PAGES_ORIGIN?: string;
 }
@@ -72,14 +75,26 @@ async function handleHealth(env: Env): Promise<Response> {
     d1Ok = false;
   }
 
-  const key = env.OPENROUTER_API_KEY?.trim();
+  const openRouter = env.OPENROUTER_API_KEY?.trim();
+  const gemini = env.GEMINI_API_KEY?.trim();
+  const openRouterOk = Boolean(openRouter && openRouter !== "MY_OPENROUTER_API_KEY");
+  const geminiOk = Boolean(gemini && gemini !== "MY_GEMINI_API_KEY");
+  let activeProvider: "openrouter" | "gemini" | "none" = "none";
+  try {
+    activeProvider = resolveExtractionCredentials(env).provider;
+  } catch {
+    activeProvider = "none";
+  }
+
   return json({
     status: "ok",
     time: new Date().toISOString(),
     d1Connected: d1Ok,
-    openRouterKeyConfigured: Boolean(key && key !== "MY_OPENROUTER_API_KEY"),
+    openRouterKeyConfigured: openRouterOk,
+    geminiKeyConfigured: geminiOk,
+    extractionReady: activeProvider !== "none",
     defaultModel: env.DEFAULT_EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL,
-    provider: "openrouter",
+    provider: activeProvider,
   });
 }
 
@@ -344,36 +359,50 @@ async function handleConvert(request: Request, env: Env, cors: HeadersInit): Pro
       return json({ error: "Missing image in request body" }, 400, cors);
     }
 
-    const apiKey = validateOpenRouterApiKey(env.OPENROUTER_API_KEY);
+    const { provider, apiKey } = resolveExtractionCredentials(env);
     const defaultModel = env.DEFAULT_EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL;
+    const extractOpts = {
+      additionalContext: body.additionalContext,
+      roomLabel: body.roomLabel,
+      model: body.model,
+      defaultModel,
+    };
     const parsed =
       body.highlightRegions && body.highlightRegions.length > 0
-        ? await extractMissedItemsFromImage(apiKey, body.image, {
-            additionalContext: body.additionalContext,
-            roomLabel: body.roomLabel,
-            model: body.model,
-            defaultModel,
-            highlightRegions: body.highlightRegions,
-          })
-        : await extractFloorplanFromImage(apiKey, body.image, {
-            additionalContext: body.additionalContext,
-            roomLabel: body.roomLabel,
-            model: body.model,
-            defaultModel,
-            windowFacing: body.windowFacing,
-          });
+        ? provider === "gemini"
+          ? await extractMissedItemsViaGemini(apiKey, body.image, {
+              ...extractOpts,
+              highlightRegions: body.highlightRegions,
+            })
+          : await extractMissedItemsFromImage(apiKey, body.image, {
+              ...extractOpts,
+              highlightRegions: body.highlightRegions,
+            })
+        : provider === "gemini"
+          ? await extractFloorplanViaGemini(apiKey, body.image, {
+              ...extractOpts,
+              windowFacing: body.windowFacing,
+            })
+          : await extractFloorplanFromImage(apiKey, body.image, {
+              ...extractOpts,
+              windowFacing: body.windowFacing,
+            });
     return json(parsed, 200, cors);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Conversion failed";
     const isAuthError =
       message.includes("401") ||
+      message.includes("403") ||
       message.includes("User not found") ||
       message.includes("OPENROUTER_API_KEY") ||
-      message.includes("Invalid API key");
+      message.includes("GEMINI_API_KEY") ||
+      message.includes("No AI API key") ||
+      message.includes("Invalid API key") ||
+      message.includes("API key not valid");
     return json(
       {
         error: isAuthError
-          ? "Invalid OpenRouter API key. Set OPENROUTER_API_KEY via wrangler secret put OPENROUTER_API_KEY"
+          ? "AI API key missing or invalid. Set OPENROUTER_API_KEY or GEMINI_API_KEY on the Worker (wrangler secret put)."
           : message,
       },
       isAuthError ? 401 : 500,

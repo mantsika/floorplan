@@ -517,6 +517,21 @@ export default function App() {
   };
 
   useEffect(() => {
+    if (!isCloudApiEnabled()) return;
+    fetch(apiUrl("/api/health"))
+      .then((r) => r.json())
+      .then((health: { extractionReady?: boolean; provider?: string }) => {
+        if (health.extractionReady === false) {
+          triggerNotification(
+            "AI extraction is not configured on the server. Set OPENROUTER_API_KEY or GEMINI_API_KEY on the Worker.",
+            true
+          );
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     const el = canvasContainerRef.current;
     if (!el) return;
     const onWheel = (e: WheelEvent) => {

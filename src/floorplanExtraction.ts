@@ -162,6 +162,91 @@ export function validateOpenRouterApiKey(apiKey: string | undefined): string {
   return key;
 }
 
+export type ExtractionProvider = "openrouter" | "gemini";
+
+export interface ExtractionCredentials {
+  provider: ExtractionProvider;
+  apiKey: string;
+}
+
+export function resolveExtractionCredentials(env: {
+  OPENROUTER_API_KEY?: string;
+  GEMINI_API_KEY?: string;
+}): ExtractionCredentials {
+  const openRouter = env.OPENROUTER_API_KEY?.trim();
+  if (openRouter && openRouter !== "MY_OPENROUTER_API_KEY") {
+    return { provider: "openrouter", apiKey: validateOpenRouterApiKey(openRouter) };
+  }
+
+  const gemini = env.GEMINI_API_KEY?.trim();
+  if (gemini && gemini !== "MY_GEMINI_API_KEY") {
+    return { provider: "gemini", apiKey: gemini };
+  }
+
+  throw new Error(
+    "No AI API key configured. Set OPENROUTER_API_KEY (https://openrouter.ai/keys) or GEMINI_API_KEY on the Worker."
+  );
+}
+
+export function resolveGeminiModelId(openRouterModelId: string): string {
+  if (openRouterModelId.startsWith("google/")) {
+    return openRouterModelId.slice("google/".length);
+  }
+  return "gemini-2.5-flash";
+}
+
+async function callGeminiJson(
+  apiKey: string,
+  model: string,
+  promptText: string,
+  image: { base64Data: string; mimeType: string },
+  maxOutputTokens: number
+): Promise<Record<string, unknown>> {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: SYSTEM_INSTRUCTION }] },
+      contents: [
+        {
+          parts: [
+            { inline_data: { mime_type: image.mimeType, data: image.base64Data } },
+            { text: promptText },
+          ],
+        },
+      ],
+      generationConfig: {
+        responseMimeType: "application/json",
+        temperature: 0.15,
+        maxOutputTokens,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new Error(errText || `Gemini API error ${response.status}`);
+  }
+
+  const result = (await response.json()) as {
+    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    error?: { message?: string };
+  };
+
+  if (result.error?.message) {
+    throw new Error(result.error.message);
+  }
+
+  const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+  if (!text) {
+    throw new Error(`No response from Gemini model ${model}`);
+  }
+
+  const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
+  return JSON.parse(cleaned) as Record<string, unknown>;
+}
+
 export interface HighlightRegion {
   x1: number;
   y1: number;
@@ -365,6 +450,87 @@ ${JSON.stringify(MISSED_ITEMS_SCHEMA)}`;
 
   const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
   const parsed = JSON.parse(cleaned) as Record<string, unknown>;
+  return postProcessExtraction({
+    walls: [],
+    rooms: [],
+    doors: parsed.doors ?? [],
+    windows: parsed.windows ?? [],
+    fixtures: parsed.fixtures ?? [],
+  });
+}
+
+/** Direct Gemini API — used when OPENROUTER_API_KEY is not configured on the Worker */
+export async function extractFloorplanViaGemini(
+  apiKey: string,
+  image: string,
+  options: ExtractionOptions = {}
+): Promise<Record<string, unknown>> {
+  const imagePayload = parseImagePayload(image);
+  const model = resolveGeminiModelId(
+    resolveModelId(options.model, options.defaultModel ?? DEFAULT_EXTRACTION_MODEL)
+  );
+  const roomLabel = options.roomLabel?.trim() || "Room";
+  const userHints = options.additionalContext?.trim() || "None";
+  const facingHint = buildWindowFacingHint(options.windowFacing ?? "north");
+
+  const promptText = `Reconstruct a top-down floor plan from this interior room photo.
+
+Room hint: ${roomLabel}
+User hints: ${userHints}
+${facingHint}
+
+Requirements:
+1. walls — exactly 4 segments; grid aspect ratio MUST match estimatedWidthM:estimatedDepthM (NOT identical for every room)
+2. windows — ALL glass visible. orientation: "h" or "v" only
+3. doors — any operable panel. orientation: "h" or "v". swing: "n"/"s"/"e"/"w"
+4. rooms — name + estimatedWidthM + estimatedDepthM + estimatedAreaM2 (all required, unique per room)
+5. fixtures — EVERY visible item including kitchen cabinets/counters/appliances; accurate x, y, width, height, rotation
+
+Kitchen photos: return cabinet runs along walls, not just stove/sink.
+The fixtures array must NOT be empty when furniture or cabinetry is visible.`;
+
+  const parsed = await callGeminiJson(apiKey, model, promptText, imagePayload, 8192);
+  return postProcessExtraction(parsed);
+}
+
+export async function extractMissedItemsViaGemini(
+  apiKey: string,
+  image: string,
+  options: ExtractionOptions & { highlightRegions: HighlightRegion[] }
+): Promise<Record<string, unknown>> {
+  const imagePayload = parseImagePayload(image);
+  const model = resolveGeminiModelId(
+    resolveModelId(options.model, options.defaultModel ?? DEFAULT_EXTRACTION_MODEL)
+  );
+  const roomLabel = options.roomLabel?.trim() || "Room";
+  const userHints = options.additionalContext?.trim() || "None";
+
+  const regionsText = options.highlightRegions
+    .map(
+      (r, i) =>
+        `Region ${i + 1}${r.label ? ` (${r.label})` : ""}: x ${r.x1}–${r.x2}, y ${r.y1}–${r.y2} on 0–1000 grid`
+    )
+    .join("\n");
+
+  const promptText = `This room photo already has a partial floor plan. The user highlighted regions where elements were MISSED.
+
+Room: ${roomLabel}
+User hints: ${userHints}
+
+Highlighted regions (0–1000 coords, top-left origin):
+${regionsText}
+
+Return ONLY doors, windows, and fixtures that belong inside these highlighted regions.
+- Do NOT return walls or rooms.
+- Use the same 0–1000 coordinate system as the full extraction.
+- orientation: "h" or "v" only. swing: "n"|"s"|"e"|"w" for doors.
+- If a region marks a side door beside glass, return a sliding door with correct width and position.
+- Return empty arrays when nothing is found in a category.
+
+Respond with valid JSON only:
+${JSON.stringify(MISSED_ITEMS_SCHEMA)}`;
+
+  const parsed = await callGeminiJson(apiKey, model, promptText, imagePayload, 4096);
   return postProcessExtraction({
     walls: [],
     rooms: [],
