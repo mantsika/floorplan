@@ -63,8 +63,14 @@ import {
   normalizeWindowType,
 } from "./architecturalItems";
 import { DoorElement, WindowElement } from "./renderElements";
-import { apiUrl, uploadImageToR2, isCloudApiEnabled, resolveImageForApi } from "./lib/api";
-import { getUserId, setUserId, useTestUser } from "./lib/userId";
+import { apiUrl, uploadImageToR2, isCloudApiEnabled, resolveImageForApi, claimTempAccount } from "./lib/api";
+import {
+  getUserSession,
+  useTestUser,
+  completeSignup,
+  getTempUserIdForClaim,
+  type UserSession,
+} from "./lib/userId";
 
 export default function App() {
   // Current edited floorplan state
@@ -141,7 +147,9 @@ export default function App() {
   const [backupInterval, setBackupInterval] = useState<number>(60);
   const [autoBackupEnabled, setAutoBackupEnabled] = useState<boolean>(true);
   const [isDraggingOver, setIsDraggingOver] = useState<boolean>(false);
-  const [storageUserId, setStorageUserId] = useState<string>(getUserId);
+  const [userSession, setUserSession] = useState<UserSession>(getUserSession);
+  const [signupUsername, setSignupUsername] = useState<string>("");
+  const [isClaiming, setIsClaiming] = useState<boolean>(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasContainerRef = useRef<HTMLDivElement>(null);
@@ -431,15 +439,48 @@ export default function App() {
   };
 
   const persistImageToStorage = async (file: File, dataUrl: string): Promise<string> => {
-    if (!isCloudApiEnabled()) return dataUrl;
+    if (!isCloudApiEnabled()) {
+      triggerNotification("R2 upload requires VITE_API_URL. Image kept in browser only.", true);
+      return dataUrl;
+    }
     try {
-      const result = await uploadImageToR2(file, dataUrl, storageUserId);
+      const session = getUserSession();
+      const result = await uploadImageToR2(file, dataUrl, session);
       triggerNotification(`Saved to R2: floorplan/${result.key}`);
       return result.url;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Upload failed";
       triggerNotification(`R2 upload failed (${msg}). Using local preview.`, true);
       return dataUrl;
+    }
+  };
+
+  const handleClaimAccount = async () => {
+    const tempId = getTempUserIdForClaim();
+    if (!tempId) {
+      triggerNotification("You already have a permanent account.", true);
+      return;
+    }
+    const username = signupUsername.trim();
+    if (!username) {
+      triggerNotification("Enter a username to save your work permanently.", true);
+      return;
+    }
+
+    setIsClaiming(true);
+    try {
+      const result = await claimTempAccount(tempId, username);
+      const session = completeSignup(username);
+      setUserSession(session);
+      setSignupUsername("");
+      triggerNotification(
+        `Account claimed! Moved ${result.movedFiles} file(s) to floorplan/${session.r2Prefix}/`
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Signup failed";
+      triggerNotification(msg, true);
+    } finally {
+      setIsClaiming(false);
     }
   };
 
@@ -2993,39 +3034,49 @@ ${cellsXml}      </root>
                 Upload a sketch, scan, or photo — AI extracts walls, doors, windows, stairs & fixtures into the playground
               </p>
               {isCloudApiEnabled() && (
-                <div className="mt-2 p-2 bg-slate-50 rounded-lg border border-slate-100">
-                  <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider block mb-1">
-                    R2 folder: floorplan/{storageUserId}/
-                  </span>
-                  <div className="flex gap-1">
-                    <input
-                      type="text"
-                      value={storageUserId}
-                      onChange={(e) => setStorageUserId(e.target.value)}
-                      className="flex-1 text-[10px] px-2 py-1 border border-slate-200 rounded font-mono"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setUserId(storageUserId);
-                        triggerNotification(`Uploads will use floorplan/${storageUserId}/`);
-                      }}
-                      className="text-[10px] px-2 py-1 bg-indigo-600 text-white rounded font-semibold"
-                    >
-                      Set
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        useTestUser();
-                        setStorageUserId("test");
-                        triggerNotification("Using test user folder: floorplan/test/");
-                      }}
-                      className="text-[10px] px-2 py-1 bg-slate-200 text-slate-700 rounded font-semibold"
-                    >
-                      Test
-                    </button>
+                <div className="mt-2 p-2 bg-slate-50 rounded-lg border border-slate-100 space-y-2">
+                  <div>
+                    <span className="text-[9px] font-bold text-slate-400 uppercase tracking-wider block mb-1">
+                      R2 bucket: floorplan/{userSession.r2Prefix}/
+                    </span>
+                    <span className="text-[10px] text-slate-500 block">
+                      {userSession.isTemp
+                        ? "Temporary guest folder — sign up to keep your uploads permanently."
+                        : userSession.type === "test"
+                        ? "Test user folder."
+                        : `Permanent account: ${userSession.userId}`}
+                    </span>
                   </div>
+                  {userSession.isTemp && (
+                    <div className="flex gap-1">
+                      <input
+                        type="text"
+                        value={signupUsername}
+                        onChange={(e) => setSignupUsername(e.target.value)}
+                        placeholder="Choose username"
+                        className="flex-1 text-[10px] px-2 py-1 border border-slate-200 rounded font-mono"
+                      />
+                      <button
+                        type="button"
+                        disabled={isClaiming}
+                        onClick={handleClaimAccount}
+                        className="text-[10px] px-2 py-1 bg-indigo-600 text-white rounded font-semibold disabled:opacity-50"
+                      >
+                        {isClaiming ? "…" : "Sign up"}
+                      </button>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const session = useTestUser();
+                      setUserSession(session);
+                      triggerNotification("Using test folder: floorplan/test/");
+                    }}
+                    className="text-[10px] px-2 py-1 bg-slate-200 text-slate-700 rounded font-semibold w-full"
+                  >
+                    Switch to test user (floorplan/test/)
+                  </button>
                 </div>
               )}
             </div>

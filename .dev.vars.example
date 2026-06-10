@@ -1,0 +1,4 @@
+# Copy to .dev.vars for local Worker testing: npm run dev:api
+# R2 + D1 are provided automatically via wrangler.jsonc bindings (no keys needed).
+
+GEMINI_API_KEY=AIzaSy...

@@ -1,4 +1,4 @@
-import { getUserId } from "./userId";
+import { UserSession, getUserSession } from "./userId";
 
 const API_BASE = (import.meta.env.VITE_API_URL as string | undefined)?.replace(/\/$/, "") ?? "";
 
@@ -6,9 +6,22 @@ export function apiUrl(path: string): string {
   return `${API_BASE}${path}`;
 }
 
+export function isCloudApiEnabled(): boolean {
+  return Boolean(API_BASE);
+}
+
+export function requireApi(): void {
+  if (!API_BASE) {
+    throw new Error("Cloud API not configured. Set VITE_API_URL to your Workers URL.");
+  }
+}
+
 export interface UploadResult {
+  id: string;
   key: string;
   userId: string;
+  userType: string;
+  r2Prefix: string;
   url: string;
   fileName: string;
 }
@@ -16,15 +29,17 @@ export interface UploadResult {
 export async function uploadImageToR2(
   file: File,
   dataUrl: string,
-  userId?: string
+  session?: UserSession
 ): Promise<UploadResult> {
-  const uid = userId ?? getUserId();
+  requireApi();
+  const s = session ?? getUserSession();
 
   const response = await fetch(apiUrl("/api/upload"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      userId: uid,
+      userId: s.userId,
+      userType: s.type,
       fileName: file.name,
       mimeType: file.type || "image/jpeg",
       data: dataUrl,
@@ -32,19 +47,39 @@ export async function uploadImageToR2(
   });
 
   if (!response.ok) {
-    const err = await response.json().catch(() => ({}));
-    throw new Error((err as { error?: string }).error || "Upload failed");
+    const err = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new Error(err.error || "Upload failed");
   }
 
   const result = (await response.json()) as UploadResult;
-  return {
-    ...result,
-    url: apiUrl(result.url),
-  };
+  return { ...result, url: apiUrl(result.url) };
 }
 
-export function isCloudApiEnabled(): boolean {
-  return Boolean(API_BASE);
+export interface ClaimResult {
+  permanentUserId: string;
+  movedFiles: number;
+  movedFloorplans: number;
+}
+
+export async function claimTempAccount(
+  tempUserId: string,
+  permanentUserId: string,
+  displayName?: string
+): Promise<ClaimResult> {
+  requireApi();
+
+  const response = await fetch(apiUrl("/api/users/claim"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tempUserId, permanentUserId, displayName }),
+  });
+
+  if (!response.ok) {
+    const err = (await response.json().catch(() => ({}))) as { error?: string };
+    throw new Error(err.error || "Failed to claim account");
+  }
+
+  return response.json() as Promise<ClaimResult>;
 }
 
 export async function resolveImageForApi(image: string): Promise<string> {
