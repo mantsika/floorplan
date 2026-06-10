@@ -5,8 +5,18 @@ dist/
 coverage/
 .DS_Store
 *.log
-.env*
+
+# Secrets & local env — NEVER commit these
+.env
+.env.local
+.env.production
+.env.development
+.env.test
+.env.*
+.dev.vars
+.dev.vars.*
+
+# Safe templates only (placeholders, no real keys)
 !.env.example
 !.env.production.example
 !.dev.vars.example
-.dev.vars

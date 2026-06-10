@@ -42,7 +42,16 @@ export const FIXTURE_ITEMS: ArchitecturalItemDef[] = [
   { id: "shower", category: "fixtures", label: "Shower", icon: "🚿", description: "Shower enclosure", defaultWidth: 55, defaultHeight: 55 },
   { id: "sink", category: "fixtures", label: "Sink", icon: "🚰", description: "Basin / vanity sink", defaultWidth: 42, defaultHeight: 36 },
   { id: "stove", category: "fixtures", label: "Stove", icon: "🔥", description: "Cooktop / range", defaultWidth: 45, defaultHeight: 45 },
+  { id: "cabinet", category: "fixtures", label: "Base Cabinet", icon: "🗄️", description: "Built-in base cupboard run", defaultWidth: 120, defaultHeight: 40 },
+  { id: "wall_cabinet", category: "fixtures", label: "Wall Cabinet", icon: "📦", description: "Upper kitchen cabinet", defaultWidth: 100, defaultHeight: 28 },
+  { id: "counter", category: "fixtures", label: "Counter", icon: "▬", description: "Countertop run", defaultWidth: 140, defaultHeight: 35 },
+  { id: "island", category: "fixtures", label: "Island", icon: "🏝️", description: "Kitchen island", defaultWidth: 90, defaultHeight: 55 },
+  { id: "fridge", category: "fixtures", label: "Fridge", icon: "🧊", description: "Refrigerator", defaultWidth: 40, defaultHeight: 55 },
+  { id: "dishwasher", category: "fixtures", label: "Dishwasher", icon: "🫧", description: "Dishwasher", defaultWidth: 40, defaultHeight: 45 },
+  { id: "washing_machine", category: "fixtures", label: "Washer", icon: "🧺", description: "Washing machine", defaultWidth: 40, defaultHeight: 45 },
   { id: "column", category: "fixtures", label: "Structural Column", icon: "⬛", description: "Load-bearing column", defaultWidth: 24, defaultHeight: 24 },
+  { id: "balcony", category: "fixtures", label: "Balcony / Terrace", icon: "🌿", description: "External balcony or terrace space", defaultWidth: 90, defaultHeight: 55 },
+  { id: "patio", category: "fixtures", label: "Patio / Deck", icon: "☀️", description: "Ground-level patio or deck", defaultWidth: 100, defaultHeight: 60 },
 ];
 
 export function getWallStyle(type: WallType, themeMode: "blueprint" | "classic") {
@@ -75,12 +84,36 @@ export function normalizeWallType(type: string | undefined): WallType {
 
 export function normalizeDoorType(type: string | undefined): DoorType {
   if (type && VALID_DOOR_TYPES.has(type as DoorType)) return type as DoorType;
+  const lower = type?.toLowerCase() ?? "";
+  if (lower.includes("sliding") || lower.includes("glass") || lower.includes("patio") || lower.includes("french")) {
+    return "sliding";
+  }
+  if (lower.includes("fold")) return "folding";
+  if (lower.includes("pocket")) return "pocket";
+  if (lower.includes("double")) return "double";
   return "hinged";
 }
 
 export function normalizeWindowType(type: string | undefined): WindowType {
   if (type && VALID_WINDOW_TYPES.has(type as WindowType)) return type as WindowType;
   return "fixed";
+}
+
+/** AI models return "horizontal", "vertical", "top" — app requires "h" | "v" */
+export function normalizeOrientation(orientation: string | undefined): "h" | "v" {
+  const o = orientation?.toLowerCase().trim() ?? "";
+  if (o === "h" || o === "horizontal" || o === "top" || o === "bottom") return "h";
+  if (o === "v" || o === "vertical" || o === "left" || o === "right") return "v";
+  return "h";
+}
+
+export function normalizeSwing(swing: string | undefined): "n" | "s" | "e" | "w" {
+  const s = swing?.toLowerCase().trim() ?? "";
+  if (s === "n" || s === "north") return "n";
+  if (s === "s" || s === "south") return "s";
+  if (s === "e" || s === "east" || s === "right") return "e";
+  if (s === "w" || s === "west" || s === "left") return "w";
+  return "n";
 }
 
 export function getFixtureDefaultSize(type: string): { w: number; h: number } {

@@ -82,18 +82,48 @@ export async function claimTempAccount(
   return response.json() as Promise<ClaimResult>;
 }
 
-export async function resolveImageForApi(image: string): Promise<string> {
-  if (image.startsWith("data:")) return image;
-
-  const url = image.startsWith("/") ? apiUrl(image) : image;
-  const response = await fetch(url);
-  if (!response.ok) throw new Error("Failed to load image for AI extraction");
-
-  const blob = await response.blob();
+function loadImageElement(src: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(new Error("Failed to encode image"));
-    reader.readAsDataURL(blob);
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Failed to decode image"));
+    img.src = src;
   });
+}
+
+export async function compressImageForApi(dataUrl: string, maxSide = 1536): Promise<string> {
+  if (!dataUrl.startsWith("data:image/")) return dataUrl;
+
+  const img = await loadImageElement(dataUrl);
+  const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+  if (scale >= 1) return dataUrl;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(img.width * scale);
+  canvas.height = Math.round(img.height * scale);
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return dataUrl;
+
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.88);
+}
+
+export async function resolveImageForApi(image: string): Promise<string> {
+  let dataUrl = image;
+
+  if (!image.startsWith("data:")) {
+    const url = image.startsWith("/") ? apiUrl(image) : image;
+    const response = await fetch(url);
+    if (!response.ok) throw new Error("Failed to load image for AI extraction");
+
+    const blob = await response.blob();
+    dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = () => reject(new Error("Failed to encode image"));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  return compressImageForApi(dataUrl);
 }

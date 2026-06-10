@@ -1,5 +1,14 @@
 import { FloorplanData } from "./types";
 
+/** Blank canvas every user sees on first load */
+export const EMPTY_FLOORPLAN: FloorplanData = {
+  walls: [],
+  doors: [],
+  windows: [],
+  rooms: [],
+  scale: { calibrated: false, pixelDistance: 400, physicalLength: 5, unit: "m" },
+};
+
 export interface FloorplanTemplate {
   name: string;
   description: string;

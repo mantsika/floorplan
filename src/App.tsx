@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import {
   Upload,
   Download,
@@ -27,6 +27,9 @@ import {
   Compass,
   Menu,
   X,
+  ZoomIn,
+  ZoomOut,
+  Maximize2,
   Settings,
   Share2,
   Code,
@@ -50,9 +53,14 @@ import {
   DoorType,
   WindowType,
   WallType,
+  MissedItemHighlight,
+  PlaygroundSheet,
+  DEFAULT_SHEET_ID,
 } from "./types";
-import { templates } from "./templates";
+import { filterBySheet } from "./lib/sheetFilter";
+import { templates, EMPTY_FLOORPLAN } from "./templates";
 import { DEFAULT_EXTRACTION_MODEL, EXTRACTION_MODELS } from "./openRouterModels";
+import { buildWindowFacingHint } from "./floorplanExtraction";
 import {
   WALL_ITEMS,
   DOOR_ITEMS,
@@ -62,9 +70,42 @@ import {
   normalizeWallType,
   normalizeDoorType,
   normalizeWindowType,
+  normalizeOrientation,
+  normalizeSwing,
 } from "./architecturalItems";
 import { DoorElement, WindowElement } from "./renderElements";
 import { apiUrl, uploadImageToR2, isCloudApiEnabled, resolveImageForApi, claimTempAccount } from "./lib/api";
+import {
+  getRoomGroupBounds,
+  isPointInRoomGroup,
+  getFixtureLocalCoords,
+  isPointInFixture,
+  inferGroupWindowFacing,
+} from "./lib/roomGroup";
+import { normalizeFixtureRotation } from "./extractionPostProcess";
+import {
+  mapImageLocalToCanvas,
+  mapImageLocalToCanvasSize,
+  mapCanvasToImageLocal,
+} from "./lib/imageCoords";
+import {
+  getWallsBbox,
+  resolveRoomDimensionsM,
+  scaleRoomGroupToRealWorld,
+  PLAYGROUND_PX_PER_M,
+  DRAWING_SCALE_LABEL,
+  SHEET_WIDTH_METERS,
+} from "./lib/roomScale";
+import {
+  DEFAULT_PLAYGROUND_VIEW,
+  computeContentBounds,
+  fitViewBoxToBounds,
+  zoomViewBoxAtPoint,
+  panViewBox,
+  viewBoxZoomPercent,
+  normalizePlaygroundView,
+  type PlaygroundViewBox,
+} from "./lib/playgroundView";
 import {
   getUserSession,
   useTestUser,
@@ -75,11 +116,11 @@ import {
 
 export default function App() {
   // Current edited floorplan state
-  const [walls, setWalls] = useState<Wall[]>(templates[0].data.walls);
-  const [doors, setDoors] = useState<Door[]>(templates[0].data.doors);
-  const [windows, setWindows] = useState<WindowLayout[]>(templates[0].data.windows);
-  const [rooms, setRooms] = useState<Room[]>(templates[0].data.rooms);
-  const [scale, setScale] = useState<ScaleConfig>(templates[0].data.scale);
+  const [walls, setWalls] = useState<Wall[]>(EMPTY_FLOORPLAN.walls);
+  const [doors, setDoors] = useState<Door[]>(EMPTY_FLOORPLAN.doors);
+  const [windows, setWindows] = useState<WindowLayout[]>(EMPTY_FLOORPLAN.windows);
+  const [rooms, setRooms] = useState<Room[]>(EMPTY_FLOORPLAN.rooms);
+  const [scale, setScale] = useState<ScaleConfig>(EMPTY_FLOORPLAN.scale);
   const [bgImages, setBgImages] = useState<BgImageCard[]>([]);
   const [selectedBgId, setSelectedBgId] = useState<string | null>(null);
 
@@ -116,7 +157,10 @@ export default function App() {
   // Upload & Conversion states
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
   const [imageOpacity, setImageOpacity] = useState<number>(0.4);
-  const [showTracingImages, setShowTracingImages] = useState<boolean>(false);
+  const [showTracingImages, setShowTracingImages] = useState<boolean>(true);
+  const [missedHighlights, setMissedHighlights] = useState<MissedItemHighlight[]>([]);
+  const [drawingHighlightStart, setDrawingHighlightStart] = useState<{ x: number; y: number } | null>(null);
+  const [highlightItemType, setHighlightItemType] = useState<"door" | "window" | "fixture">("door");
   const [isConverting, setIsConverting] = useState<boolean>(false);
   const [additionalContext, setAdditionalContext] = useState<string>("");
   const [selectedModel, setSelectedModel] = useState<string>(() => {
@@ -130,7 +174,17 @@ export default function App() {
   const [drawingWallStart, setDrawingWallStart] = useState<{ x: number; y: number } | null>(null);
   const [tempMousePos, setTempMousePos] = useState<{ x: number; y: number } | null>(null);
   const [draggingJoint, setDraggingJoint] = useState<{ x: number; y: number; originalX: number; originalY: number } | null>(null);
-  const [draggingElement, setDraggingElement] = useState<{ type: "door" | "window" | "room" | "bg_image" | "fixture"; id: string; offsetX: number; offsetY: number } | null>(null);
+  const [draggingElement, setDraggingElement] = useState<{
+    type: "door" | "window" | "room" | "bg_image" | "room_group" | "fixture" | "fixture_rotate" | "fixture_scale";
+    id: string;
+    offsetX?: number;
+    offsetY?: number;
+    startAngle?: number;
+    startRotation?: number;
+    startDist?: number;
+    startWidth?: number;
+    startHeight?: number;
+  } | null>(null);
   
   // Calibration auxiliary state
   const [calibrationPoint, setCalibrationPoint] = useState<{ x: number; y: number } | null>(null);
@@ -138,8 +192,8 @@ export default function App() {
   const [nudgeStep, setNudgeStep] = useState<number>(5);
 
   // Project details (shown on blueprint and printable sheet)
-  const [projectTitle, setProjectTitle] = useState<string>("Resident Renovation Plan");
-  const [clientName, setClientName] = useState<string>("S. Mantsika");
+  const [projectTitle, setProjectTitle] = useState<string>("Untitled Project");
+  const [clientName, setClientName] = useState<string>("");
   const [contractorNotes, setContractorNotes] = useState<string>("Calibrated for structural frame estimates. All dimensions to be validated before partition installation.");
   const [showClearConfirm, setShowClearConfirm] = useState<boolean>(false);
   const [sidebarTab, setSidebarTab] = useState<"properties" | "templates">("properties");
@@ -158,6 +212,81 @@ export default function App() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasContainerRef = useRef<HTMLDivElement>(null);
+  const [playgroundView, setPlaygroundView] = useState<PlaygroundViewBox>(DEFAULT_PLAYGROUND_VIEW);
+  const [isPanningView, setIsPanningView] = useState(false);
+  const panViewStartRef = useRef<{ clientX: number; clientY: number; viewBox: PlaygroundViewBox } | null>(null);
+  const [autoFitViewPending, setAutoFitViewPending] = useState(false);
+  const [playgroundSheets, setPlaygroundSheets] = useState<PlaygroundSheet[]>([
+    { id: DEFAULT_SHEET_ID, name: "Ground Floor" },
+  ]);
+  const [activeSheetId, setActiveSheetId] = useState(DEFAULT_SHEET_ID);
+
+  const sheetWalls = useMemo(() => filterBySheet(walls, activeSheetId), [walls, activeSheetId]);
+  const sheetDoors = useMemo(() => filterBySheet(doors, activeSheetId), [doors, activeSheetId]);
+  const sheetWindows = useMemo(() => filterBySheet(windows, activeSheetId), [windows, activeSheetId]);
+  const sheetRooms = useMemo(() => filterBySheet(rooms, activeSheetId), [rooms, activeSheetId]);
+  const sheetFixtures = useMemo(() => filterBySheet(fixtures, activeSheetId), [fixtures, activeSheetId]);
+  const sheetBgImages = useMemo(() => filterBySheet(bgImages, activeSheetId), [bgImages, activeSheetId]);
+  const sheetDimensionLines = useMemo(
+    () => filterBySheet(dimensionLines, activeSheetId),
+    [dimensionLines, activeSheetId]
+  );
+  const sheetHighlights = useMemo(
+    () => filterBySheet(missedHighlights, activeSheetId),
+    [missedHighlights, activeSheetId]
+  );
+
+  const switchPlaygroundSheet = useCallback(
+    (nextSheetId: string) => {
+      setPlaygroundSheets((prev) =>
+        prev.map((s) =>
+          s.id === activeSheetId ? { ...s, viewBox: playgroundView } : s
+        )
+      );
+      const nextSheet = playgroundSheets.find((s) => s.id === nextSheetId);
+      setActiveSheetId(nextSheetId);
+      setPlaygroundView(
+        normalizePlaygroundView(nextSheet?.viewBox ?? DEFAULT_PLAYGROUND_VIEW)
+      );
+      setSelectedBgId(null);
+      setSelectedElement({ type: "none", id: "" });
+    },
+    [activeSheetId, playgroundView, playgroundSheets]
+  );
+
+  const addPlaygroundSheet = () => {
+    const id = `sheet_${Date.now()}`;
+    const name = `Floor ${playgroundSheets.length + 1}`;
+    setPlaygroundSheets((prev) => [...prev, { id, name }]);
+    setPlaygroundView(DEFAULT_PLAYGROUND_VIEW);
+    setActiveSheetId(id);
+    setSelectedBgId(null);
+    setSelectedElement({ type: "none", id: "" });
+    triggerNotification(`Added worksheet "${name}" — arrange rooms for another floor or wing.`);
+  };
+
+  const deletePlaygroundSheet = (sheetId: string) => {
+    if (playgroundSheets.length <= 1) return;
+    const target = playgroundSheets.find((s) => s.id === sheetId);
+    if (!window.confirm(`Delete worksheet "${target?.name}" and all its content?`)) return;
+    saveHistoryState();
+    const belongs = (sid?: string) => (sid ?? DEFAULT_SHEET_ID) !== sheetId;
+    setWalls((prev) => prev.filter((w) => belongs(w.sheetId)));
+    setDoors((prev) => prev.filter((d) => belongs(d.sheetId)));
+    setWindows((prev) => prev.filter((w) => belongs(w.sheetId)));
+    setRooms((prev) => prev.filter((r) => belongs(r.sheetId)));
+    setFixtures((prev) => prev.filter((f) => belongs(f.sheetId)));
+    setBgImages((prev) => prev.filter((b) => belongs(b.sheetId)));
+    setDimensionLines((prev) => prev.filter((d) => belongs(d.sheetId)));
+    setMissedHighlights((prev) => prev.filter((h) => belongs(h.sheetId)));
+    setPlaygroundSheets((prev) => prev.filter((s) => s.id !== sheetId));
+    if (activeSheetId === sheetId) {
+      const remaining = playgroundSheets.filter((s) => s.id !== sheetId);
+      const fallback = remaining[0]?.id ?? DEFAULT_SHEET_ID;
+      setActiveSheetId(fallback);
+      setPlaygroundView(remaining[0]?.viewBox ?? DEFAULT_PLAYGROUND_VIEW);
+    }
+  };
 
   // Unit Conversion helper
   const convertDistanceValue = (value: number, from: "m" | "cm" | "ft" | "in", to: "m" | "cm" | "ft" | "in"): number => {
@@ -198,6 +327,9 @@ export default function App() {
       bgImages: JSON.parse(JSON.stringify(bgImages)),
       dimensionLines: JSON.parse(JSON.stringify(dimensionLines)),
       fixtures: JSON.parse(JSON.stringify(fixtures)),
+      missedHighlights: JSON.parse(JSON.stringify(missedHighlights)),
+      playgroundSheets: JSON.parse(JSON.stringify(playgroundSheets)),
+      activeSheetId,
     };
     setUndoStack((prev) => [...prev, backup]);
     setRedoStack([]); // Clear redo
@@ -218,6 +350,9 @@ export default function App() {
       bgImages: JSON.parse(JSON.stringify(bgImages)),
       dimensionLines: JSON.parse(JSON.stringify(dimensionLines)),
       fixtures: JSON.parse(JSON.stringify(fixtures)),
+      missedHighlights: JSON.parse(JSON.stringify(missedHighlights)),
+      playgroundSheets: JSON.parse(JSON.stringify(playgroundSheets)),
+      activeSheetId,
     };
     setRedoStack((prev) => [...prev, current]);
 
@@ -230,6 +365,9 @@ export default function App() {
     setBgImages(previous.bgImages || []);
     setDimensionLines(previous.dimensionLines || []);
     setFixtures(previous.fixtures || []);
+    setMissedHighlights(previous.missedHighlights || []);
+    if (previous.playgroundSheets) setPlaygroundSheets(previous.playgroundSheets);
+    if (previous.activeSheetId) setActiveSheetId(previous.activeSheetId);
 
     setUndoStack((prev) => prev.slice(0, prev.length - 1));
     setSelectedElement({ type: "none", id: "" });
@@ -250,6 +388,9 @@ export default function App() {
       bgImages: JSON.parse(JSON.stringify(bgImages)),
       dimensionLines: JSON.parse(JSON.stringify(dimensionLines)),
       fixtures: JSON.parse(JSON.stringify(fixtures)),
+      missedHighlights: JSON.parse(JSON.stringify(missedHighlights)),
+      playgroundSheets: JSON.parse(JSON.stringify(playgroundSheets)),
+      activeSheetId,
     };
     setUndoStack((prev) => [...prev, current]);
 
@@ -262,6 +403,9 @@ export default function App() {
     setBgImages(next.bgImages || []);
     setDimensionLines(next.dimensionLines || []);
     setFixtures(next.fixtures || []);
+    setMissedHighlights(next.missedHighlights || []);
+    if (next.playgroundSheets) setPlaygroundSheets(next.playgroundSheets);
+    if (next.activeSheetId) setActiveSheetId(next.activeSheetId);
 
     setRedoStack((prev) => prev.slice(0, prev.length - 1));
     setSelectedElement({ type: "none", id: "" });
@@ -281,6 +425,9 @@ export default function App() {
       bgImages,
       dimensionLines,
       fixtures,
+      missedHighlights,
+      playgroundSheets,
+      activeSheetId,
     };
     localStorage.setItem("blueprint_floorplan_saved", JSON.stringify(localData));
     triggerNotification("Progress saved locally!");
@@ -300,6 +447,17 @@ export default function App() {
         setBgImages(loaded.bgImages || []);
         setDimensionLines(loaded.dimensionLines || []);
         setFixtures(loaded.fixtures || []);
+        setMissedHighlights(loaded.missedHighlights || []);
+        if (loaded.playgroundSheets?.length) {
+          setPlaygroundSheets(loaded.playgroundSheets);
+          setActiveSheetId(loaded.activeSheetId ?? DEFAULT_SHEET_ID);
+          const active = loaded.playgroundSheets.find(
+            (s: PlaygroundSheet) => s.id === (loaded.activeSheetId ?? DEFAULT_SHEET_ID)
+          );
+          if (active?.viewBox) {
+            setPlaygroundView(normalizePlaygroundView(active.viewBox));
+          }
+        }
         if (loaded.projectTitle) setProjectTitle(loaded.projectTitle);
         if (loaded.clientName) setClientName(loaded.clientName);
         if (loaded.contractorNotes) setContractorNotes(loaded.contractorNotes);
@@ -322,16 +480,108 @@ export default function App() {
     }
   };
 
-  // Convert coordinate spacing between screen dimensions and internal 0..1000 grid
+  const collectPlaygroundContentPoints = (): Array<{ x: number; y: number }> => {
+    const points: Array<{ x: number; y: number }> = [];
+    sheetWalls.forEach((w) => {
+      points.push({ x: w.x1, y: w.y1 }, { x: w.x2, y: w.y2 });
+    });
+    sheetDoors.forEach((d) => points.push({ x: d.x, y: d.y }));
+    sheetWindows.forEach((w) => points.push({ x: w.x, y: w.y }));
+    sheetFixtures.forEach((f) => points.push({ x: f.x, y: f.y }));
+    sheetBgImages.forEach((bg) => points.push({ x: bg.x, y: bg.y }));
+    return points;
+  };
+
+  const fitPlaygroundToContent = () => {
+    const bounds = computeContentBounds(collectPlaygroundContentPoints());
+    if (bounds) {
+      setPlaygroundView(normalizePlaygroundView(fitViewBoxToBounds(bounds)));
+    }
+  };
+
+  const zoomPlaygroundAtCenter = (zoomIn: boolean) => {
+    setPlaygroundView((prev) => {
+      const cx = prev.x + prev.w / 2;
+      const cy = prev.y + prev.h / 2;
+      return normalizePlaygroundView(zoomViewBoxAtPoint(prev, cx, cy, zoomIn));
+    });
+  };
+
+  // Convert screen coordinates to SVG playground space (respects zoom/pan viewBox)
   const getSvgCoordinates = (e: React.MouseEvent<SVGSVGElement>): { x: number; y: number } => {
     const rect = e.currentTarget.getBoundingClientRect();
-    const scaleX = 1000 / rect.width;
-    const scaleY = 1000 / rect.height;
     return {
-      x: (e.clientX - rect.left) * scaleX,
-      y: (e.clientY - rect.top) * scaleY,
+      x: playgroundView.x + ((e.clientX - rect.left) / rect.width) * playgroundView.w,
+      y: playgroundView.y + ((e.clientY - rect.top) / rect.height) * playgroundView.h,
     };
   };
+
+  useEffect(() => {
+    const el = canvasContainerRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const svg = el.querySelector("svg");
+      if (!svg) return;
+      const rect = svg.getBoundingClientRect();
+      setPlaygroundView((prev) => {
+        const focusX = prev.x + ((e.clientX - rect.left) / rect.width) * prev.w;
+        const focusY = prev.y + ((e.clientY - rect.top) / rect.height) * prev.h;
+        return normalizePlaygroundView(
+          zoomViewBoxAtPoint(prev, focusX, focusY, e.deltaY < 0)
+        );
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  useEffect(() => {
+    if (!autoFitViewPending) return;
+    const bounds = computeContentBounds(collectPlaygroundContentPoints());
+    if (bounds) {
+      const contentW = bounds.maxX - bounds.minX;
+      const contentH = bounds.maxY - bounds.minY;
+      const overflowsSheet =
+        contentW > 880 ||
+        contentH > 880 ||
+        bounds.minX < 20 ||
+        bounds.minY < 20 ||
+        bounds.maxX > 980 ||
+        bounds.maxY > 980;
+      setPlaygroundView(
+        overflowsSheet ? fitViewBoxToBounds(bounds) : DEFAULT_PLAYGROUND_VIEW
+      );
+    } else {
+      setPlaygroundView(DEFAULT_PLAYGROUND_VIEW);
+    }
+    setAutoFitViewPending(false);
+  }, [autoFitViewPending, sheetWalls, sheetDoors, sheetWindows, sheetFixtures, sheetBgImages]);
+
+  useEffect(() => {
+    if (!isPanningView) return;
+    const onMove = (e: MouseEvent) => {
+      const start = panViewStartRef.current;
+      const container = canvasContainerRef.current;
+      if (!start || !container) return;
+      const svg = container.querySelector("svg");
+      if (!svg) return;
+      const rect = svg.getBoundingClientRect();
+      const dx = ((e.clientX - start.clientX) / rect.width) * start.viewBox.w;
+      const dy = ((e.clientY - start.clientY) / rect.height) * start.viewBox.h;
+      setPlaygroundView(panViewBox(start.viewBox, dx, dy));
+    };
+    const onUp = () => {
+      setIsPanningView(false);
+      panViewStartRef.current = null;
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [isPanningView]);
 
   // Snap engine for grids & joints
   const getSnappedCoords = (x: number, y: number): { x: number; y: number; snapped: string } => {
@@ -340,7 +590,7 @@ export default function App() {
 
     // 1. Joint Snapping (Very helpful for wall joints!)
     const JOINT_RADIUS = 20;
-    for (const w of walls) {
+    for (const w of sheetWalls) {
       if (Math.hypot(w.x1 - x, w.y1 - y) < JOINT_RADIUS) {
         return { x: w.x1, y: w.y1, snapped: "joint" };
       }
@@ -365,13 +615,30 @@ export default function App() {
     return Math.hypot(w.x2 - w.x1, w.y2 - w.y1);
   };
 
-  const getWallPhysicalLengthStr = (w: { x1: number; y1: number; x2: number; y2: number }): string => {
-    const pixelLen = getWallLength(w);
-    if (!scale.calibrated) {
-      return `${Math.round(pixelLen)}px`;
+  const getMetersPerPixelForWall = (w: { bgImageId?: string }): number | null => {
+    if (w.bgImageId) {
+      const bg = bgImages.find((b) => b.id === w.bgImageId);
+      if (bg?.metersPerPixel) return bg.metersPerPixel;
     }
-    const physicalLen = pixelLen * (scale.physicalLength / scale.pixelDistance);
-    return `${physicalLen.toFixed(2)} ${scale.unit}`;
+    if (scale.calibrated && scale.pixelDistance > 0) {
+      return scale.physicalLength / scale.pixelDistance;
+    }
+    return null;
+  };
+
+  const getWallPhysicalLengthStr = (w: {
+    x1: number;
+    y1: number;
+    x2: number;
+    y2: number;
+    bgImageId?: string;
+  }): string => {
+    const pixelLen = getWallLength(w);
+    const mPerPx = getMetersPerPixelForWall(w);
+    if (mPerPx) {
+      return `${(pixelLen * mPerPx).toFixed(2)} m`;
+    }
+    return `${Math.round(pixelLen)}px`;
   };
 
   const getRoomAreaStr = (room: Room): string => {
@@ -516,38 +783,56 @@ export default function App() {
     saveHistoryState();
     const count = files.length;
     let loadedCount = 0;
+    const addedBlocks: BgImageCard[] = [];
 
     files.forEach((file: File, index) => {
       const reader = new FileReader();
       reader.onload = async () => {
         if (typeof reader.result === "string") {
           const imageUrl = await persistImageToStorage(file, reader.result);
+          const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+            const probe = new Image();
+            probe.onload = () => {
+              const aspect = probe.width / probe.height;
+              const base = 380;
+              resolve(
+                aspect >= 1
+                  ? { w: base, h: Math.round(base / aspect) }
+                  : { w: Math.round(base * aspect), h: base }
+              );
+            };
+            probe.onerror = () => resolve({ w: 380, h: 380 });
+            probe.src = reader.result as string;
+          });
           const newCard: BgImageCard = {
             id: `bg_img_${Date.now()}_${index}`,
             url: imageUrl,
             name: file.name.substring(0, file.name.lastIndexOf(".")) || `Room Segment ${bgImages.length + index + 1}`,
-            x: 400 + (index * 70) % 300, 
-            y: 350 + (index * 60) % 300,
-            scale: 1.2,
+            x: 140 + (index % 2) * 420,
+            y: 140 + Math.floor(index / 2) * 380,
+            scale: 1,
             rotation: 0,
-            width: 320,
-            height: 240,
+            width: dims.w,
+            height: dims.h,
+            windowFacing: "north",
+            sheetId: activeSheetId,
           };
           
+          addedBlocks.push(newCard);
           setBgImages((prev) => [...prev, newCard]);
           setSelectedBgId(newCard.id);
+          setShowTracingImages(true);
           
           if (!uploadedImage) {
             setUploadedImage(imageUrl);
           }
           
-          // Auto-trigger Gemini floorplan digitization for this individual block segment!
-          // This populates the playground immediately with the extracted vector elements.
-          handleDigitizeFloorplan(newCard);
-          
           loadedCount++;
           if (loadedCount === count) {
-            triggerNotification(`Added ${count} room sketch layouts, and initiated auto-digitization for each!`);
+            triggerNotification(
+              `Added ${count} room image${count > 1 ? "s" : ""}. AI is reconstructing floor plans for each block...`
+            );
+            handleDigitizeAllBlocks(addedBlocks);
           }
         }
       };
@@ -597,45 +882,10 @@ export default function App() {
     }
   };
 
-  // Call Express API endpoint to run Gemini AI conversions
-  const handleDigitizeFloorplan = async (specificBgObj?: BgImageCard) => {
-    let selectedBgObj = specificBgObj || (selectedBgId ? bgImages.find((bg) => bg.id === selectedBgId) : null);
-    let sourceImage = selectedBgObj ? selectedBgObj.url : uploadedImage;
+  const isBgImageCard = (value: unknown): value is BgImageCard =>
+    Boolean(value && typeof value === "object" && "id" in value && "url" in value);
 
-    if (!sourceImage) {
-      triggerNotification("Please upload an image or choose/select a Lego block tracing sheet first.", true);
-      return;
-    }
-
-    setIsConverting(true);
-    setApiError(null);
-    setSuccessMessage(
-      selectedBgObj
-        ? `Analyzing block "${selectedBgObj.name}" with ${selectedModel}...`
-        : `Analyzing floorplan with ${selectedModel}...`
-    );
-
-    try {
-      const imagePayload = await resolveImageForApi(sourceImage);
-      const response = await fetch(apiUrl("/api/convert-floorplan"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          image: imagePayload,
-          additionalContext: additionalContext,
-          model: selectedModel,
-        }),
-      });
-
-      if (!response.ok) {
-        const errJson: { error?: string } = await response.json();
-        throw new Error(errJson.error ?? "Failed to parse floorplan.");
-      }
-
-      const parsedResult: FloorplanData = await response.json();
-
-      saveHistoryState();
-
+  const applyExtractionToCanvas = (parsedResult: FloorplanData, selectedBgObj: BgImageCard | null) => {
       let processedWalls: Wall[] = [];
       let processedDoors: Door[] = [];
       let processedWindows: WindowLayout[] = [];
@@ -644,44 +894,10 @@ export default function App() {
 
       if (selectedBgObj) {
         const bg = selectedBgObj;
-        
-        // Helper to map Gemini's 0-1000 coordinate space exactly to the block's current scale/rotation/pos on-canvas
-        const mapLocalToCanvas = (px: number, py: number) => {
-          const u = px / 1000;
-          const v = py / 1000;
-          const xOffset = u * bg.width;
-          const yOffset = v * bg.height;
-          const xLocal = xOffset - (bg.width / 2);
-          const yLocal = yOffset - (bg.height / 2);
-          const xScaled = xLocal * bg.scale;
-          const yScaled = yLocal * bg.scale;
-
-          if (bg.rotation) {
-            const rad = (bg.rotation * Math.PI) / 180;
-            const cos = Math.cos(rad);
-            const sin = Math.sin(rad);
-            const xRotated = xScaled * cos - yScaled * sin;
-            const yRotated = xScaled * sin + yScaled * cos;
-            return {
-              x: Math.round(bg.x + xRotated),
-              y: Math.round(bg.y + yRotated),
-            };
-          } else {
-            return {
-              x: Math.round(bg.x + xScaled),
-              y: Math.round(bg.y + yScaled),
-            };
-          }
-        };
-
-        const mapLocalToCanvasWidth = (w: number) => {
-          const widthLocal = (w / 1000) * bg.width;
-          return Math.max(15, Math.round(widthLocal * bg.scale));
-        };
 
         processedWalls = (parsedResult.walls || []).map((w, index) => {
-          const p1 = mapLocalToCanvas(w.x1, w.y1);
-          const p2 = mapLocalToCanvas(w.x2, w.y2);
+          const p1 = mapImageLocalToCanvas(bg, w.x1, w.y1);
+          const p2 = mapImageLocalToCanvas(bg, w.x2, w.y2);
           return {
             ...w,
             id: w.id || `ai_wall_${index}_${Date.now()}`,
@@ -691,57 +907,68 @@ export default function App() {
             x2: p2.x,
             y2: p2.y,
             bgImageId: bg.id,
+            sheetId: activeSheetId,
           };
         });
 
         processedDoors = (parsedResult.doors || []).map((d, index) => {
-          const p = mapLocalToCanvas(d.x, d.y);
+          const p = mapImageLocalToCanvas(bg, d.x, d.y);
           return {
             ...d,
             id: d.id || `ai_door_${index}_${Date.now()}`,
             doorType: normalizeDoorType(d.doorType),
+            orientation: normalizeOrientation(d.orientation),
+            swing: normalizeSwing(d.swing),
             x: p.x,
             y: p.y,
-            width: mapLocalToCanvasWidth(d.width || 60),
+            width: mapImageLocalToCanvasSize(bg, d.width || 60, true),
             bgImageId: bg.id,
+            sheetId: activeSheetId,
           };
         });
 
         processedWindows = (parsedResult.windows || []).map((wn, index) => {
-          const p = mapLocalToCanvas(wn.x, wn.y);
+          const p = mapImageLocalToCanvas(bg, wn.x, wn.y);
           return {
             ...wn,
             id: wn.id || `ai_window_${index}_${Date.now()}`,
             windowType: normalizeWindowType(wn.windowType),
+            orientation: normalizeOrientation(wn.orientation),
             x: p.x,
             y: p.y,
-            width: mapLocalToCanvasWidth(wn.width || 80),
+            width: mapImageLocalToCanvasSize(bg, wn.width || 80, true),
             bgImageId: bg.id,
+            sheetId: activeSheetId,
           };
         });
 
         processedRooms = (parsedResult.rooms || []).map((r, index) => {
-          const p = mapLocalToCanvas(r.x, r.y);
+          const p = mapImageLocalToCanvas(bg, r.x, r.y);
           return {
             ...r,
             id: r.id || `ai_room_${index}_${Date.now()}`,
             x: p.x,
             y: p.y,
+            estimatedWidthM: r.estimatedWidthM,
+            estimatedDepthM: r.estimatedDepthM,
             bgImageId: bg.id,
+            sheetId: activeSheetId,
           };
         });
 
         processedFixtures = (parsedResult.fixtures || []).map((f, index) => {
-          const p = mapLocalToCanvas(f.x, f.y);
+          const p = mapImageLocalToCanvas(bg, f.x, f.y);
           return {
             ...f,
             id: f.id || `ai_fixture_${index}_${Date.now()}`,
             x: p.x,
             y: p.y,
-            width: mapLocalToCanvasWidth(f.width || 60),
-            height: mapLocalToCanvasWidth(f.height || 60),
-            rotation: f.rotation ?? 0,
+            width: mapImageLocalToCanvasSize(bg, f.width || 60, true),
+            height: mapImageLocalToCanvasSize(bg, f.height || 60, false),
+            rotation: normalizeFixtureRotation(f.rotation),
+            label: f.label || f.type,
             bgImageId: bg.id,
+            sheetId: activeSheetId,
           };
         });
       } else {
@@ -765,6 +992,8 @@ export default function App() {
           ...d,
           id: d.id || `ai_door_${index}_${Date.now()}`,
           doorType: normalizeDoorType(d.doorType),
+          orientation: normalizeOrientation(d.orientation),
+          swing: normalizeSwing(d.swing),
           x: scaleCoord(d.x),
           y: scaleCoord(d.y),
           width: scaleSize(d.width || 60),
@@ -774,6 +1003,7 @@ export default function App() {
           ...wn,
           id: wn.id || `ai_window_${index}_${Date.now()}`,
           windowType: normalizeWindowType(wn.windowType),
+          orientation: normalizeOrientation(wn.orientation),
           x: scaleCoord(wn.x),
           y: scaleCoord(wn.y),
           width: scaleSize(wn.width || 80),
@@ -797,41 +1027,427 @@ export default function App() {
         }));
       }
 
-      setWalls((prev) => [...prev, ...processedWalls]);
-      setDoors((prev) => [...prev, ...processedDoors]);
-      setWindows((prev) => [...prev, ...processedWindows]);
-      setRooms((prev) => [...prev, ...processedRooms]);
-      if (processedFixtures.length > 0) {
-        setFixtures((prev) => [...prev, ...processedFixtures]);
+    let finalWalls = processedWalls;
+    let finalDoors = processedDoors;
+    let finalWindows = processedWindows;
+    let finalRooms = processedRooms;
+    let finalFixtures = processedFixtures;
+    let roomScaleMeta:
+      | { widthM: number; depthM: number; metersPerPixel: number; bgScale: number; bgX: number; bgY: number }
+      | undefined;
+
+    if (selectedBgObj && processedWalls.length > 0) {
+      const bbox = getWallsBbox(processedWalls);
+      const roomMeta = parsedResult.rooms?.[0];
+      if (bbox) {
+        const { widthM, depthM } = resolveRoomDimensionsM(
+          roomMeta?.estimatedWidthM,
+          roomMeta?.estimatedDepthM,
+          roomMeta?.estimatedAreaM2,
+          bbox
+        );
+        const scaled = scaleRoomGroupToRealWorld(
+          processedWalls,
+          processedDoors,
+          processedWindows,
+          processedRooms,
+          processedFixtures,
+          widthM,
+          depthM,
+          { x: selectedBgObj.x, y: selectedBgObj.y },
+          selectedBgObj.scale
+        );
+        finalWalls = scaled.walls;
+        finalDoors = scaled.doors;
+        finalWindows = scaled.windows;
+        finalRooms = scaled.rooms;
+        finalFixtures = scaled.fixtures;
+        roomScaleMeta = {
+          widthM: scaled.widthM,
+          depthM: scaled.depthM,
+          metersPerPixel: scaled.metersPerPixel,
+          bgScale: selectedBgObj.scale * scaled.bgScaleMultiplier,
+          bgX: scaled.bgAnchor.x,
+          bgY: scaled.bgAnchor.y,
+        };
       }
-      
-      // Calibrate scale ratio corresponding to the scaled down dimension (halved distance: 400 * 0.5 = 200px)
+    }
+
+    setWalls((prev) => [...prev, ...finalWalls]);
+    setDoors((prev) => [...prev, ...finalDoors]);
+    setWindows((prev) => [...prev, ...finalWindows]);
+    setRooms((prev) => [...prev, ...finalRooms]);
+    if (finalFixtures.length > 0) {
+      setFixtures((prev) => [...prev, ...finalFixtures]);
+    }
+
+    if (!scale.calibrated) {
       setScale({
         calibrated: true,
-        pixelDistance: 200,
-        physicalLength: 5.0,
+        pixelDistance: PLAYGROUND_PX_PER_M,
+        physicalLength: 1,
         unit: "m",
       });
+    }
 
-      const fixtureCount = processedFixtures.length;
-      const summary = [
-        `${processedWalls.length} walls`,
-        `${processedDoors.length} doors`,
-        `${processedWindows.length} windows`,
-        `${processedRooms.length} rooms`,
-        fixtureCount > 0 ? `${fixtureCount} fixtures` : null,
-      ]
-        .filter(Boolean)
-        .join(", ");
+    const fixtureCount = finalFixtures.length;
+    const totalElements =
+      finalWalls.length +
+      finalDoors.length +
+      finalWindows.length +
+      finalRooms.length +
+      fixtureCount;
+
+    const summary = [
+      `${finalWalls.length} walls`,
+      `${finalDoors.length} doors`,
+      `${finalWindows.length} windows`,
+      `${finalRooms.length} rooms`,
+      fixtureCount > 0 ? `${fixtureCount} fixtures` : null,
+      roomScaleMeta ? `${roomScaleMeta.widthM}×${roomScaleMeta.depthM}m` : null,
+    ]
+      .filter(Boolean)
+      .join(", ");
+
+    const detectedRoomName = parsedResult.rooms?.[0]?.name?.trim();
+
+    return { totalElements, summary, detectedRoomName, roomScaleMeta };
+  };
+
+  const isNearExistingElement = (
+    x: number,
+    y: number,
+    bgId: string,
+    kind: "door" | "window" | "fixture",
+    threshold = 45
+  ) => {
+    const dist = (ax: number, ay: number) => Math.hypot(ax - x, ay - y);
+    if (kind === "door") {
+      return doors.some((d) => d.bgImageId === bgId && dist(d.x, d.y) < threshold);
+    }
+    if (kind === "window") {
+      return windows.some((w) => w.bgImageId === bgId && dist(w.x, w.y) < threshold);
+    }
+    return fixtures.some((f) => f.bgImageId === bgId && dist(f.x, f.y) < threshold);
+  };
+
+  const applyRefinementToCanvas = (
+    parsedResult: FloorplanData,
+    bg: BgImageCard
+  ): { added: number; summary: string } => {
+    const newDoors: Door[] = [];
+    const newWindows: WindowLayout[] = [];
+    const newFixtures: Fixture[] = [];
+
+    (parsedResult.doors || []).forEach((d, index) => {
+      const p = mapImageLocalToCanvas(bg, d.x, d.y);
+      if (isNearExistingElement(p.x, p.y, bg.id, "door")) return;
+      newDoors.push({
+        ...d,
+        id: d.id || `ai_door_ref_${index}_${Date.now()}`,
+        doorType: normalizeDoorType(d.doorType),
+        orientation: normalizeOrientation(d.orientation),
+        swing: normalizeSwing(d.swing),
+        x: p.x,
+        y: p.y,
+        width: mapImageLocalToCanvasSize(bg, d.width || 60, true),
+        bgImageId: bg.id,
+      });
+    });
+
+    (parsedResult.windows || []).forEach((wn, index) => {
+      const p = mapImageLocalToCanvas(bg, wn.x, wn.y);
+      if (isNearExistingElement(p.x, p.y, bg.id, "window")) return;
+      newWindows.push({
+        ...wn,
+        id: wn.id || `ai_window_ref_${index}_${Date.now()}`,
+        windowType: normalizeWindowType(wn.windowType),
+        orientation: normalizeOrientation(wn.orientation),
+        x: p.x,
+        y: p.y,
+        width: mapImageLocalToCanvasSize(bg, wn.width || 80, true),
+        bgImageId: bg.id,
+      });
+    });
+
+    (parsedResult.fixtures || []).forEach((f, index) => {
+      const p = mapImageLocalToCanvas(bg, f.x, f.y);
+      if (isNearExistingElement(p.x, p.y, bg.id, "fixture")) return;
+      newFixtures.push({
+        ...f,
+        id: f.id || `ai_fixture_ref_${index}_${Date.now()}`,
+        x: p.x,
+        y: p.y,
+        width: mapImageLocalToCanvasSize(bg, f.width || 60, true),
+        height: mapImageLocalToCanvasSize(bg, f.height || 60, false),
+        rotation: normalizeFixtureRotation(f.rotation),
+        label: f.label || f.type,
+        bgImageId: bg.id,
+        sheetId: activeSheetId,
+      });
+    });
+
+    if (newDoors.length > 0) setDoors((prev) => [...prev, ...newDoors]);
+    if (newWindows.length > 0) setWindows((prev) => [...prev, ...newWindows]);
+    if (newFixtures.length > 0) setFixtures((prev) => [...prev, ...newFixtures]);
+
+    const added = newDoors.length + newWindows.length + newFixtures.length;
+    const summary = [
+      newDoors.length > 0 ? `${newDoors.length} door(s)` : null,
+      newWindows.length > 0 ? `${newWindows.length} window(s)` : null,
+      newFixtures.length > 0 ? `${newFixtures.length} fixture(s)` : null,
+    ]
+      .filter(Boolean)
+      .join(", ");
+
+    return { added, summary };
+  };
+
+  const startRoomGroupDrag = (groupId: string, coords: { x: number; y: number }) => {
+    const bg = bgImages.find((b) => b.id === groupId);
+    if (!bg) return;
+    setSelectedBgId(groupId);
+    setSelectedElement({ type: "none", id: "" });
+    setDraggingElement({
+      type: "room_group",
+      id: groupId,
+      offsetX: bg.x - coords.x,
+      offsetY: bg.y - coords.y,
+    });
+  };
+
+  const finalizeBlockExtraction = (
+    blockId: string,
+    detectedRoomName?: string,
+    roomScale?: { widthM: number; depthM: number; metersPerPixel: number; bgScale: number; bgX: number; bgY: number }
+  ) => {
+    const aiName = detectedRoomName?.trim();
+    setShowTracingImages(true);
+    setBgImages((prev) =>
+      prev.map((bg) =>
+        bg.id === blockId
+          ? {
+              ...bg,
+              extracted: true,
+              showReferencePhoto: true,
+              ...(aiName ? { name: aiName } : {}),
+              ...(roomScale
+                ? {
+                    roomWidthM: roomScale.widthM,
+                    roomDepthM: roomScale.depthM,
+                    metersPerPixel: roomScale.metersPerPixel,
+                    scale: roomScale.bgScale,
+                    x: roomScale.bgX,
+                    y: roomScale.bgY,
+                  }
+                : {}),
+            }
+          : bg
+      )
+    );
+    if (aiName) {
+      setRooms((prev) =>
+        prev.map((r) => (r.bgImageId === blockId ? { ...r, name: aiName } : r))
+      );
+    }
+  };
+
+  const extractSingleBlock = async (
+    selectedBgObj: BgImageCard | null,
+    sourceImage: string
+  ): Promise<{ totalElements: number; summary: string }> => {
+    const imagePayload = await resolveImageForApi(sourceImage);
+    const facingHint = buildWindowFacingHint(selectedBgObj?.windowFacing ?? "north");
+    const mergedContext = [additionalContext?.trim(), facingHint].filter(Boolean).join(" ");
+    const response = await fetch(apiUrl("/api/convert-floorplan"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image: imagePayload,
+        additionalContext: mergedContext,
+        roomLabel: selectedBgObj?.name,
+        model: selectedModel,
+        windowFacing: selectedBgObj?.windowFacing ?? "north",
+      }),
+    });
+
+    if (!response.ok) {
+      const errJson: { error?: string } = await response.json();
+      throw new Error(errJson.error ?? "Failed to parse floorplan.");
+    }
+
+    const parsedResult: FloorplanData = await response.json();
+    saveHistoryState();
+    const result = applyExtractionToCanvas(parsedResult, selectedBgObj);
+    if (selectedBgObj && result.totalElements > 0) {
+      finalizeBlockExtraction(selectedBgObj.id, result.detectedRoomName, result.roomScaleMeta);
+    }
+    return result;
+  };
+
+  const handleRefineMissedHighlights = async () => {
+    const bg = selectedBgId ? bgImages.find((b) => b.id === selectedBgId) : null;
+    if (!bg?.extracted) {
+      triggerNotification("Select an extracted room with highlights first.", true);
+      return;
+    }
+
+    const roomHighlights = missedHighlights.filter((h) => h.bgImageId === bg.id);
+    if (roomHighlights.length === 0) {
+      triggerNotification("Draw highlight boxes over missed items on the reference photo first.", true);
+      return;
+    }
+
+    const highlightRegions = roomHighlights.map((h) => {
+      const p1 = mapCanvasToImageLocal(bg, h.x1, h.y1);
+      const p2 = mapCanvasToImageLocal(bg, h.x2, h.y2);
+      return {
+        x1: Math.min(p1.x, p2.x),
+        y1: Math.min(p1.y, p2.y),
+        x2: Math.max(p1.x, p2.x),
+        y2: Math.max(p1.y, p2.y),
+        label: h.label,
+      };
+    });
+
+    setIsConverting(true);
+    setApiError(null);
+    try {
+      const imagePayload = await resolveImageForApi(bg.url);
+      const response = await fetch(apiUrl("/api/convert-floorplan"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          image: imagePayload,
+          additionalContext: additionalContext,
+          roomLabel: bg.name,
+          model: selectedModel,
+          highlightRegions,
+        }),
+      });
+
+      if (!response.ok) {
+        const errJson: { error?: string } = await response.json();
+        throw new Error(errJson.error ?? "Failed to refine floorplan.");
+      }
+
+      const parsedResult: FloorplanData = await response.json();
+      saveHistoryState();
+      const { added, summary } = applyRefinementToCanvas(parsedResult, bg);
+      if (added > 0) {
+        setMissedHighlights((prev) => prev.filter((h) => h.bgImageId !== bg.id));
+        setTool("select");
+        triggerNotification(`Added missed items: ${summary}`);
+      } else {
+        triggerNotification("No new items found in highlighted regions. Try larger highlights or add manually.", true);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Refinement failed";
+      setApiError(msg);
+      triggerNotification(msg, true);
+    } finally {
+      setIsConverting(false);
+    }
+  };
+
+  const resolveBgImageIdForPlacement = (coords: { x: number; y: number }): string | undefined => {
+    if (selectedBgId) {
+      const selected = bgImages.find((b) => b.id === selectedBgId);
+      if (selected?.extracted) return selected.id;
+    }
+    for (let i = bgImages.length - 1; i >= 0; i--) {
+      const bg = bgImages[i];
+      if (!bg.extracted) continue;
+      const bounds = getRoomGroupBounds(bg.id, walls, doors, windows, rooms, fixtures);
+      if (bounds && isPointInRoomGroup(coords.x, coords.y, bounds)) {
+        return bg.id;
+      }
+    }
+    return undefined;
+  };
+
+  const handleDigitizeFloorplan = async (specificBgObj?: BgImageCard) => {
+    const blockArg = isBgImageCard(specificBgObj) ? specificBgObj : undefined;
+    const selectedBgObj =
+      blockArg ?? (selectedBgId ? bgImages.find((bg) => bg.id === selectedBgId) : null);
+    const sourceImage = selectedBgObj?.url ?? uploadedImage;
+
+    if (!sourceImage) {
+      triggerNotification("Upload room images first, or select a block to extract.", true);
+      return;
+    }
+
+    setIsConverting(true);
+    setApiError(null);
+    setSuccessMessage(
+      selectedBgObj
+        ? `Reconstructing "${selectedBgObj.name}" with ${selectedModel}...`
+        : `Reconstructing floor plan with ${selectedModel}...`
+    );
+
+    try {
+      const { totalElements, summary } = await extractSingleBlock(selectedBgObj, sourceImage);
+
+      if (totalElements === 0) {
+        triggerNotification(
+          `AI could not reconstruct a layout from "${selectedBgObj?.name ?? "this image"}". Try Gemini 2.5 Pro or GPT-4o, or add hints in Custom Architectural Hints.`,
+          true
+        );
+        return;
+      }
 
       triggerNotification(
         selectedBgObj
-          ? `AI extraction complete on "${selectedBgObj.name}": ${summary}. Drag elements in the playground to refine.`
-          : `AI extraction complete: ${summary}. Move and combine elements in the playground.`
+          ? `Extracted "${selectedBgObj.name}": ${summary}. Drag the room group on canvas to position it (Alt+drag to adjust one item).`
+          : `Extraction complete: ${summary}. Move and combine elements in the playground.`
       );
     } catch (err: any) {
       console.error(err);
       triggerNotification(err.message || "AI could not parse this image. Try another model or edit manually.", true);
+    } finally {
+      setIsConverting(false);
+    }
+  };
+
+  const handleDigitizeAllBlocks = async (blocks?: BgImageCard[]) => {
+    const targets = (blocks?.length ? blocks : bgImages).filter(
+      (b) => (b.sheetId ?? DEFAULT_SHEET_ID) === activeSheetId
+    );
+    if (targets.length === 0) {
+      triggerNotification("Upload one or more room images first.", true);
+      return;
+    }
+
+    setIsConverting(true);
+    setApiError(null);
+    let successCount = 0;
+
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        const block = targets[i];
+        setSelectedBgId(block.id);
+        setSuccessMessage(`Extracting block ${i + 1}/${targets.length}: "${block.name}"...`);
+
+        try {
+          const { totalElements, summary } = await extractSingleBlock(block, block.url);
+          if (totalElements > 0) {
+            successCount++;
+            triggerNotification(`Block ${i + 1}/${targets.length} "${block.name}": ${summary}`);
+          } else {
+            triggerNotification(`Block "${block.name}": no layout detected. Try a stronger model.`, true);
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : "Extraction failed";
+          triggerNotification(`Block "${block.name}" failed: ${msg}`, true);
+        }
+      }
+
+      if (successCount > 0) {
+        setAutoFitViewPending(true);
+        triggerNotification(
+          `Done: ${successCount}/${targets.length} block(s) extracted at scale ${DRAWING_SCALE_LABEL}. Pan/zoom as needed — add worksheets for other floors.`
+        );
+      }
     } finally {
       setIsConverting(false);
     }
@@ -876,6 +1492,7 @@ export default function App() {
           x2: snapped.x,
           y2: snapped.y,
           type: selectedWallType,
+          sheetId: activeSheetId,
         };
         setWalls((prev) => [...prev, newWall]);
         setDrawingWallStart(null); // End drawing
@@ -883,10 +1500,22 @@ export default function App() {
       return;
     }
 
+    // --- HIGHLIGHT MISSED ITEMS ---
+    if (tool === "highlight_miss") {
+      const bg = selectedBgId ? bgImages.find((b) => b.id === selectedBgId) : null;
+      if (!bg?.extracted || bg.showReferencePhoto === false) {
+        triggerNotification("Select an extracted room with reference photo visible.", true);
+        return;
+      }
+      setDrawingHighlightStart({ x: coords.x, y: coords.y });
+      return;
+    }
+
     // --- ADD DOOR ENGINE ---
     if (tool === "add_door") {
       saveHistoryState();
       const doorDef = DOOR_ITEMS.find((d) => d.type === selectedDoorType) ?? DOOR_ITEMS[0];
+      const linkedBgId = resolveBgImageIdForPlacement(snapped);
       const newDoor: Door = {
         id: `door_${Date.now()}`,
         x: snapped.x,
@@ -895,6 +1524,8 @@ export default function App() {
         orientation: "h",
         swing: "n",
         doorType: selectedDoorType,
+        ...(linkedBgId ? { bgImageId: linkedBgId } : {}),
+        sheetId: activeSheetId,
       };
       setDoors((prev) => [...prev, newDoor]);
       setSelectedElement({ type: "door", id: newDoor.id });
@@ -906,6 +1537,7 @@ export default function App() {
     if (tool === "add_window") {
       saveHistoryState();
       const winDef = WINDOW_ITEMS.find((w) => w.type === selectedWindowType) ?? WINDOW_ITEMS[0];
+      const linkedBgId = resolveBgImageIdForPlacement(snapped);
       const newWin: WindowLayout = {
         id: `win_${Date.now()}`,
         x: snapped.x,
@@ -913,6 +1545,8 @@ export default function App() {
         width: winDef.defaultWidth,
         orientation: "h",
         windowType: selectedWindowType,
+        ...(linkedBgId ? { bgImageId: linkedBgId } : {}),
+        sheetId: activeSheetId,
       };
       setWindows((prev) => [...prev, newWin]);
       setSelectedElement({ type: "window", id: newWin.id });
@@ -929,6 +1563,7 @@ export default function App() {
         x: snapped.x,
         y: snapped.y,
         estimatedAreaM2: 12.0,
+        sheetId: activeSheetId,
       };
       setRooms((prev) => [...prev, newRoom]);
       setSelectedElement({ type: "room", id: newRoom.id });
@@ -948,6 +1583,7 @@ export default function App() {
         width: sizeDef.w,
         height: sizeDef.h,
         rotation: 0,
+        sheetId: activeSheetId,
       };
       setFixtures((prev) => [...prev, newFixture]);
       setSelectedElement({ type: "fixture", id: newFixture.id });
@@ -957,9 +1593,12 @@ export default function App() {
 
     // --- SELECT / INTERACTION MODE ---
     if (tool === "select") {
-      // 1. Check if user clicked a joint-node within snapping distance (dragging joint)
+      // Shift+click/drag on an element moves the whole room group; normal click edits that element
+      const wantGroupDrag = e.shiftKey;
+
+      // 1. Wall joints — always editable, even inside a room group
       const jointRadius = 15;
-      for (const w of walls) {
+      for (const w of sheetWalls) {
         if (Math.hypot(w.x1 - coords.x, w.y1 - coords.y) < jointRadius) {
           setDraggingJoint({ x: w.x1, y: w.y1, originalX: w.x1, originalY: w.y1 });
           return;
@@ -971,8 +1610,13 @@ export default function App() {
       }
 
       // 2. Check if clicked on a Door
-      for (const d of doors) {
+      for (const d of sheetDoors) {
         if (Math.hypot(d.x - coords.x, d.y - coords.y) < 25) {
+          if (d.bgImageId && wantGroupDrag) {
+            saveHistoryState();
+            startRoomGroupDrag(d.bgImageId, coords);
+            return;
+          }
           setSelectedElement({ type: "door", id: d.id });
           setDraggingElement({
             type: "door",
@@ -985,8 +1629,13 @@ export default function App() {
       }
 
       // 3. Check if clicked on a Window
-      for (const wn of windows) {
+      for (const wn of sheetWindows) {
         if (Math.hypot(wn.x - coords.x, wn.y - coords.y) < 25) {
+          if (wn.bgImageId && wantGroupDrag) {
+            saveHistoryState();
+            startRoomGroupDrag(wn.bgImageId, coords);
+            return;
+          }
           setSelectedElement({ type: "window", id: wn.id });
           setDraggingElement({
             type: "window",
@@ -999,8 +1648,13 @@ export default function App() {
       }
 
       // 4. Check if clicked on a Room Label
-      for (const r of rooms) {
+      for (const r of sheetRooms) {
         if (Math.hypot(r.x - coords.x, r.y - coords.y) < 30) {
+          if (r.bgImageId && wantGroupDrag) {
+            saveHistoryState();
+            startRoomGroupDrag(r.bgImageId, coords);
+            return;
+          }
           setSelectedElement({ type: "room", id: r.id });
           setDraggingElement({
             type: "room",
@@ -1012,23 +1666,54 @@ export default function App() {
         }
       }
 
-      // 4b. Check if clicked on a Fixture stamp
-      for (const f of fixtures) {
-        const hitDistance = Math.max(30, Math.min(f.width, f.height) / 1.2);
-        if (Math.hypot(f.x - coords.x, f.y - coords.y) < hitDistance) {
-          setSelectedElement({ type: "fixture", id: f.id });
-          setDraggingElement({
-            type: "fixture",
-            id: f.id,
-            offsetX: f.x - coords.x,
-            offsetY: f.y - coords.y,
-          });
+      // 4b. Fixture stamps — always individually editable (drag / rotate / scale)
+      for (const f of sheetFixtures) {
+        const halfW = f.width / 2;
+        const halfH = f.height / 2;
+        const { lx, ly } = getFixtureLocalCoords(f, coords.x, coords.y);
+
+        const isSelected = selectedElement.type === "fixture" && selectedElement.id === f.id;
+        if (isSelected) {
+          if (Math.hypot(lx, ly + halfH + 22) < 16) {
+            saveHistoryState();
+            setSelectedElement({ type: "fixture", id: f.id });
+            setDraggingElement({ type: "fixture_rotate", id: f.id });
+            return;
+          }
+          if (Math.hypot(lx - halfW, ly - halfH) < 16) {
+            saveHistoryState();
+            setSelectedElement({ type: "fixture", id: f.id });
+            setDraggingElement({
+              type: "fixture_scale",
+              id: f.id,
+              startWidth: f.width,
+              startHeight: f.height,
+            });
+            return;
+          }
+        }
+
+        if (!isPointInFixture(f, coords.x, coords.y)) continue;
+
+        if (f.bgImageId && wantGroupDrag) {
+          saveHistoryState();
+          startRoomGroupDrag(f.bgImageId, coords);
           return;
         }
+
+        saveHistoryState();
+        setSelectedElement({ type: "fixture", id: f.id });
+        setDraggingElement({
+          type: "fixture",
+          id: f.id,
+          offsetX: f.x - coords.x,
+          offsetY: f.y - coords.y,
+        });
+        return;
       }
 
       // 5. Check if clicked on a Wall Line segment direct (to select for styling or deleted)
-      for (const w of walls) {
+      for (const w of sheetWalls) {
         // Calculate point-to-line segment distance
         const len = getWallLength(w);
         if (len === 0) continue;
@@ -1038,15 +1723,29 @@ export default function App() {
           const py = w.y1 + u * (w.y2 - w.y1);
           const dist = Math.hypot(coords.x - px, coords.y - py);
           if (dist < 12) {
+            if (w.bgImageId && wantGroupDrag) {
+              saveHistoryState();
+              startRoomGroupDrag(w.bgImageId, coords);
+              return;
+            }
             setSelectedElement({ type: "wall", id: w.id });
             return;
           }
         }
       }
 
-      // 6. Check if clicked inside a Background Tracing Lego Card (backward traverse to hit uppermost first)
-      for (let i = bgImages.length - 1; i >= 0; i--) {
-        const bg = bgImages[i];
+      // 6. Background tracing block or extracted room group anchor
+      for (let i = sheetBgImages.length - 1; i >= 0; i--) {
+        const bg = sheetBgImages[i];
+        if (bg.extracted) {
+          const bounds = getRoomGroupBounds(bg.id, sheetWalls, sheetDoors, sheetWindows, sheetRooms, sheetFixtures);
+          if (bounds && isPointInRoomGroup(coords.x, coords.y, bounds, 28)) {
+            saveHistoryState();
+            startRoomGroupDrag(bg.id, coords);
+            return;
+          }
+          continue;
+        }
         const halfW = (bg.width * bg.scale) / 2;
         const halfH = (bg.height * bg.scale) / 2;
         if (
@@ -1056,7 +1755,7 @@ export default function App() {
           coords.y <= bg.y + halfH
         ) {
           setSelectedBgId(bg.id);
-          setSelectedElement({ type: "none", id: "" }); // clear vector item selected
+          setSelectedElement({ type: "none", id: "" });
           setDraggingElement({
             type: "bg_image",
             id: bg.id,
@@ -1064,6 +1763,18 @@ export default function App() {
             offsetY: bg.y - coords.y,
           });
           triggerNotification(`Tracing Block selected: "${bg.name}". Drag to fit or rotate.`);
+          return;
+        }
+      }
+
+      // 7. Empty space inside an extracted room group → move the whole group
+      for (let i = bgImages.length - 1; i >= 0; i--) {
+        const bg = bgImages[i];
+        if (!bg.extracted) continue;
+        const bounds = getRoomGroupBounds(bg.id, walls, doors, windows, rooms, fixtures);
+        if (bounds && isPointInRoomGroup(coords.x, coords.y, bounds)) {
+          saveHistoryState();
+          startRoomGroupDrag(bg.id, coords);
           return;
         }
       }
@@ -1126,23 +1837,79 @@ export default function App() {
         setRooms((prev) =>
           prev.map((r) => (r.id === draggingElement.id ? { ...r, x: snapped.x, y: snapped.y } : r))
         );
-      } else if (draggingElement.type === "bg_image") {
-        setBgImages((prev) =>
-          prev.map((bg) =>
-            bg.id === draggingElement.id
-              ? { ...bg, x: Math.round(targetX), y: Math.round(targetY) }
-              : bg
-          )
-        );
+      } else if (draggingElement.type === "bg_image" || draggingElement.type === "room_group") {
+        const bg = bgImages.find((b) => b.id === draggingElement.id);
+        if (bg) {
+          const newX = Math.round(targetX);
+          const newY = Math.round(targetY);
+          const dx = newX - bg.x;
+          const dy = newY - bg.y;
+          if (dx !== 0 || dy !== 0) {
+            shiftGroupedElements(bg.id, dx, dy);
+            setBgImages((prev) =>
+              prev.map((b) => (b.id === bg.id ? { ...b, x: newX, y: newY } : b))
+            );
+          }
+        }
       } else if (draggingElement.type === "fixture") {
         setFixtures((prev) =>
           prev.map((f) => (f.id === draggingElement.id ? { ...f, x: snapped.x, y: snapped.y } : f))
         );
+      } else if (draggingElement.type === "fixture_rotate") {
+        const f = fixtures.find((x) => x.id === draggingElement.id);
+        if (f) {
+          const dx = coords.x - f.x;
+          const dy = coords.y - f.y;
+          const angle = Math.round(((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360);
+          setFixtures((prev) =>
+            prev.map((x) => (x.id === f.id ? { ...x, rotation: angle } : x))
+          );
+        }
+      } else if (draggingElement.type === "fixture_scale") {
+        const f = fixtures.find((x) => x.id === draggingElement.id);
+        if (f) {
+          const dx = coords.x - f.x;
+          const dy = coords.y - f.y;
+          const rad = -((f.rotation || 0) * Math.PI) / 180;
+          const lx = Math.abs(dx * Math.cos(rad) - dy * Math.sin(rad));
+          const ly = Math.abs(dx * Math.sin(rad) + dy * Math.cos(rad));
+          setFixtures((prev) =>
+            prev.map((x) =>
+              x.id === f.id
+                ? { ...x, width: Math.max(20, Math.round(lx * 2)), height: Math.max(20, Math.round(ly * 2)) }
+                : x
+            )
+          );
+        }
       }
     }
   };
 
   const handleCanvasMouseUp = () => {
+    if (drawingHighlightStart && tool === "highlight_miss" && tempMousePos) {
+      const w = Math.abs(tempMousePos.x - drawingHighlightStart.x);
+      const h = Math.abs(tempMousePos.y - drawingHighlightStart.y);
+      if (w > 10 && h > 10 && selectedBgId) {
+        saveHistoryState();
+        setMissedHighlights((prev) => [
+          ...prev,
+          {
+            id: `hl_${Date.now()}`,
+            bgImageId: selectedBgId,
+            x1: drawingHighlightStart.x,
+            y1: drawingHighlightStart.y,
+            x2: tempMousePos.x,
+            y2: tempMousePos.y,
+            label: highlightItemType,
+            sheetId: activeSheetId,
+          },
+        ]);
+        triggerNotification(`Highlighted ${highlightItemType} region — draw more or run AI refine.`);
+      }
+      setDrawingHighlightStart(null);
+      return;
+    }
+
     if (draggingJoint) {
       // Done moving sharing wall joint, store into history
       saveHistoryState();
@@ -1300,6 +2067,13 @@ export default function App() {
     setRooms((prev) => prev.map((r) => r.bgImageId === bgId ? { ...r, x: r.x + dx, y: r.y + dy } : r));
     setDimensionLines((prev) => prev.map((dl) => dl.bgImageId === bgId ? { ...dl, x1: dl.x1 + dx, y1: dl.y1 + dy, x2: dl.x2 + dx, y2: dl.y2 + dy } : dl));
     setFixtures((prev) => prev.map((f) => f.bgImageId === bgId ? { ...f, x: f.x + dx, y: f.y + dy } : f));
+    setMissedHighlights((prev) =>
+      prev.map((h) =>
+        h.bgImageId === bgId
+          ? { ...h, x1: h.x1 + dx, y1: h.y1 + dy, x2: h.x2 + dx, y2: h.y2 + dy }
+          : h
+      )
+    );
   };
 
   const rotateGroupedElements = (bgId: string, center: { x: number; y: number }, dThetaDeg: number) => {
@@ -1347,8 +2121,50 @@ export default function App() {
     setFixtures((prev) => prev.map((f) => {
       if (f.bgImageId !== bgId) return f;
       const p = rotPoint(f.x, f.y);
-      return { ...f, x: p.x, y: p.y, rotation: ((f.rotation || 0) + dThetaDeg) % 360 };
+      return { ...f, x: p.x, y: p.y, rotation: ((f.rotation || 0) + dThetaDeg + 360) % 360 };
     }));
+    setMissedHighlights((prev) =>
+      prev.map((h) => {
+        if (h.bgImageId !== bgId) return h;
+        const p1 = rotPoint(h.x1, h.y1);
+        const p2 = rotPoint(h.x2, h.y2);
+        return { ...h, x1: p1.x, y1: p1.y, x2: p2.x, y2: p2.y };
+      })
+    );
+  };
+
+  const rotatePointAround = (
+    px: number,
+    py: number,
+    pivot: { x: number; y: number },
+    dThetaDeg: number
+  ) => {
+    const rad = (dThetaDeg * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const dx = px - pivot.x;
+    const dy = py - pivot.y;
+    return {
+      x: Math.round(pivot.x + dx * cos - dy * sin),
+      y: Math.round(pivot.y + dx * sin + dy * cos),
+    };
+  };
+
+  const getRoomGroupPivot = (bg: BgImageCard): { x: number; y: number } => {
+    if (bg.extracted) {
+      const bounds = getRoomGroupBounds(bg.id, walls, doors, windows, rooms, fixtures);
+      if (bounds) return { x: bounds.cx, y: bounds.cy };
+    }
+    return { x: bg.x, y: bg.y };
+  };
+
+  const rotateRoomGroupBy = (deltaDeg: number) => {
+    if (!selectedBgId || deltaDeg === 0) return;
+    const bg = bgImages.find((b) => b.id === selectedBgId);
+    if (!bg) return;
+    saveHistoryState();
+    const newRotation = ((bg.rotation + deltaDeg) % 360 + 360) % 360;
+    updateSelectedBgImage({ rotation: newRotation });
   };
 
   const scaleGroupedElements = (bgId: string, center: { x: number; y: number }, scaleFactor: number) => {
@@ -1411,11 +2227,17 @@ export default function App() {
         }
       }
       
-      // 2. Rotational changes
+      // 2. Rotational changes — pivot at room center for extracted groups
       if (fields.rotation !== undefined) {
         const dTheta = fields.rotation - currentBg.rotation;
         if (dTheta !== 0) {
-          rotateGroupedElements(selectedBgId, { x: currentBg.x, y: currentBg.y }, dTheta);
+          const pivot = getRoomGroupPivot(currentBg);
+          rotateGroupedElements(selectedBgId, pivot, dTheta);
+          if (currentBg.extracted) {
+            const newAnchor = rotatePointAround(currentBg.x, currentBg.y, pivot, dTheta);
+            fields.x = newAnchor.x;
+            fields.y = newAnchor.y;
+          }
         }
       }
       
@@ -1430,6 +2252,11 @@ export default function App() {
     setBgImages((prev) =>
       prev.map((bg) => (bg.id === selectedBgId ? { ...bg, ...fields } : bg))
     );
+    if (fields.name && selectedBgId) {
+      setRooms((prev) =>
+        prev.map((r) => (r.bgImageId === selectedBgId ? { ...r, name: fields.name! } : r))
+      );
+    }
   };
 
   const nudgeSelectedBgImage = (dx: number, dy: number) => {
@@ -1627,17 +2454,22 @@ ${cellsXml}      </root>
     } else {
       setShowClearConfirm(false);
       saveHistoryState();
-      setWalls([]);
-      setDoors([]);
-      setWindows([]);
-      setRooms([]);
+      setWalls(EMPTY_FLOORPLAN.walls);
+      setDoors(EMPTY_FLOORPLAN.doors);
+      setWindows(EMPTY_FLOORPLAN.windows);
+      setRooms(EMPTY_FLOORPLAN.rooms);
       setFixtures([]);
       setBgImages([]);
       setSelectedBgId(null);
       setDimensionLines([]);
-      setScale({ calibrated: false, pixelDistance: 400, physicalLength: 5, unit: "m" });
+      setScale({ ...EMPTY_FLOORPLAN.scale });
       setSelectedElement({ type: "none", id: "" });
       setUploadedImage(null);
+      setPlaygroundView(DEFAULT_PLAYGROUND_VIEW);
+      setPlaygroundSheets([{ id: DEFAULT_SHEET_ID, name: "Ground Floor" }]);
+      setActiveSheetId(DEFAULT_SHEET_ID);
+      setMissedHighlights([]);
+      setShowTracingImages(false);
       triggerNotification("Workspace cleared.");
     }
   };
@@ -2083,6 +2915,42 @@ ${cellsXml}      </root>
             </div>
 
             <div className="flex items-center gap-2">
+              {/* Playground zoom & pan */}
+              <div className="flex items-center gap-0.5 bg-slate-50 border border-slate-200 rounded-lg p-0.5">
+                <button
+                  type="button"
+                  onClick={() => zoomPlaygroundAtCenter(true)}
+                  className="p-1.5 rounded-md hover:bg-white text-slate-600 hover:text-indigo-600 transition-colors cursor-pointer"
+                  title="Zoom in"
+                >
+                  <ZoomIn className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => zoomPlaygroundAtCenter(false)}
+                  className="p-1.5 rounded-md hover:bg-white text-slate-600 hover:text-indigo-600 transition-colors cursor-pointer"
+                  title="Zoom out"
+                >
+                  <ZoomOut className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={fitPlaygroundToContent}
+                  className="p-1.5 rounded-md hover:bg-white text-slate-600 hover:text-indigo-600 transition-colors cursor-pointer"
+                  title="Fit all rooms in view"
+                >
+                  <Maximize2 className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPlaygroundView(DEFAULT_PLAYGROUND_VIEW)}
+                  className="px-1.5 py-1 rounded-md hover:bg-white text-[10px] font-bold font-mono text-slate-500 hover:text-indigo-600 transition-colors cursor-pointer min-w-[42px]"
+                  title="Reset to full 1:100 sheet view"
+                >
+                  {viewBoxZoomPercent(playgroundView)}%
+                </button>
+              </div>
+
               {/* General Grid Snap Switcher */}
               <button
                 onClick={() => setGridSnapping(!gridSnapping)}
@@ -2115,7 +2983,7 @@ ${cellsXml}      </root>
             <span className="text-indigo-900 flex items-center gap-1.5 font-medium">
               <span className="w-2 h-2 rounded-full bg-indigo-600 animate-pulse" />
               <strong>Active Tool:</strong>{" "}
-              {tool === "select" && "Select & Edit. Drag shared joint circles to adjust walls. Select elements to customize."}
+              {tool === "select" && `Select & Edit. Sheet at ${DRAWING_SCALE_LABEL} (~${SHEET_WIDTH_METERS} m). Scroll to zoom out, middle-mouse pan, ⊡ to fit oversized layouts.`}
               {tool === "add_wall" && "Partition Drawing. Click anywhere to start, click again to drop the wall corner."}
               {tool === "add_door" && `Placement Mode. Click along a wall to place a ${DOOR_ITEMS.find((d) => d.type === selectedDoorType)?.label ?? "door"}.`}
               {tool === "add_window" && "Placement Mode. Click wall locations to add double-glazed vector windows."}
@@ -2133,10 +3001,73 @@ ${cellsXml}      </root>
             )}
           </div>
 
+          {/* WORKSHEET TABS — one sheet per floor/wing at 1:100 */}
+          <div className="flex items-center gap-1 px-2 py-1.5 bg-white border border-slate-200 rounded-lg overflow-x-auto shadow-sm">
+            <Layers className="w-3.5 h-3.5 text-slate-400 shrink-0 ml-0.5" />
+            {playgroundSheets.map((sheet) => {
+              const isActive = sheet.id === activeSheetId;
+              return (
+                <div key={sheet.id} className="flex items-center shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => switchPlaygroundSheet(sheet.id)}
+                    className={`px-3 py-1.5 text-xs font-semibold rounded-md transition-colors cursor-pointer ${
+                      isActive
+                        ? "bg-indigo-600 text-white shadow-sm"
+                        : "bg-slate-50 text-slate-600 hover:bg-slate-100"
+                    }`}
+                    title={`Switch to ${sheet.name}`}
+                  >
+                    {sheet.name}
+                  </button>
+                  {playgroundSheets.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deletePlaygroundSheet(sheet.id);
+                      }}
+                      className="p-1 ml-0.5 rounded text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors cursor-pointer"
+                      title={`Delete ${sheet.name}`}
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+              );
+            })}
+            <button
+              type="button"
+              onClick={addPlaygroundSheet}
+              className="flex items-center gap-1 px-2.5 py-1.5 text-xs font-bold text-indigo-600 hover:bg-indigo-50 rounded-md transition-colors cursor-pointer shrink-0 ml-1"
+              title="Add worksheet for another floor or wing"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              Page
+            </button>
+            <span className="text-[10px] text-slate-400 ml-auto shrink-0 hidden sm:inline font-mono">
+              {DRAWING_SCALE_LABEL} · ~{SHEET_WIDTH_METERS} m per sheet
+            </span>
+          </div>
+
           {/* CANVAS VIEWPORT STAGE */}
           <div
             ref={canvasContainerRef}
-            className="w-full aspect-square border border-slate-200 rounded-xl overflow-hidden shadow-inner relative select-none bg-white"
+            className={`w-full aspect-square border border-slate-200 rounded-xl overflow-hidden shadow-inner relative select-none bg-white ${
+              isPanningView ? "cursor-grabbing" : ""
+            }`}
+            onMouseDown={(e) => {
+              if (e.button === 1) {
+                e.preventDefault();
+                setIsPanningView(true);
+                panViewStartRef.current = {
+                  clientX: e.clientX,
+                  clientY: e.clientY,
+                  viewBox: playgroundView,
+                };
+              }
+            }}
+            onContextMenu={(e) => e.preventDefault()}
           >
             {/* Pop-up Overlay for Dimension Input right over the plan */}
             {pendingDimension && (
@@ -2215,6 +3146,7 @@ ${cellsXml}      </root>
                           physicalLength: physicalVal,
                           unit: scale.unit as any,
                           note: dimNoteInput.trim() || `Measured segment`,
+                          sheetId: activeSheetId,
                         };
                         setDimensionLines((prev) => [...prev, newDim]);
                         
@@ -2246,13 +3178,13 @@ ${cellsXml}      </root>
             <svg
               width="100%"
               height="100%"
-              viewBox="0 0 1000 1000"
+              viewBox={`${playgroundView.x} ${playgroundView.y} ${playgroundView.w} ${playgroundView.h}`}
               onMouseDown={handleCanvasMouseDown}
               onMouseMove={handleCanvasMouseMove}
               onMouseUp={handleCanvasMouseUp}
-              className={`absolute inset-0 z-10 transition-colors duration-200 cursor-crosshair ${
-                themeMode === "blueprint" ? "bg-blueprint" : "bg-blueprint-light"
-              }`}
+              className={`absolute inset-0 z-10 transition-colors duration-200 ${
+                isPanningView ? "cursor-grabbing" : "cursor-crosshair"
+              } ${themeMode === "blueprint" ? "bg-blueprint" : "bg-blueprint-light"}`}
             >
               {/* Primary Background Tracing Template Image (visible under layout vectors) */}
               {showTracingImages && uploadedImage && bgImages.length === 0 && (
@@ -2268,7 +3200,8 @@ ${cellsXml}      </root>
               )}
 
               {/* 0. Render multiple Lego Background Tracing Card Elements */}
-              {showTracingImages && bgImages.map((bg) => {
+              {showTracingImages && sheetBgImages.map((bg) => {
+                if (bg.extracted) return null;
                 const isSelected = selectedBgId === bg.id;
                 const halfW = bg.width / 2;
                 const halfH = bg.height / 2;
@@ -2277,7 +3210,6 @@ ${cellsXml}      </root>
                     key={bg.id}
                     transform={`translate(${bg.x}, ${bg.y}) scale(${bg.scale}) rotate(${bg.rotation})`}
                   >
-                    {/* Highlight outline indicator if selected */}
                     {isSelected && (
                       <rect
                         x={-halfW - 4}
@@ -2292,7 +3224,6 @@ ${cellsXml}      </root>
                       />
                     )}
                     
-                    {/* The image graphic element */}
                     <image
                       href={bg.url}
                       x={-halfW}
@@ -2303,7 +3234,6 @@ ${cellsXml}      </root>
                       className={isSelected ? "cursor-grabbing" : "cursor-grab"}
                     />
 
-                    {/* Room Block Title Tab overlay (for labelling bedroom 3, kitchen etc.) */}
                     <g transform={`translate(${-halfW + 6}, ${-halfH + 6})`}>
                       <rect
                         width={Math.max(90, bg.name.length * 6.5 + 24)}
@@ -2327,18 +3257,159 @@ ${cellsXml}      </root>
                 );
               })}
               {/* SVGs definitions: Custom Blueprint Grids if background css has limits */}
+              {/* Drawing sheet frame — architectural 1:100 worksheet boundary */}
+              <g pointerEvents="none" aria-hidden="true">
+                <rect
+                  x="0"
+                  y="0"
+                  width="1000"
+                  height="1000"
+                  fill="rgba(255,255,255,0.02)"
+                  stroke={themeMode === "blueprint" ? "#3B82F6" : "#CBD5E1"}
+                  strokeWidth="2"
+                />
+                <text
+                  x="14"
+                  y="22"
+                  fontSize="11"
+                  fontWeight="bold"
+                  fill={themeMode === "blueprint" ? "#93C5FD" : "#64748B"}
+                  fontFamily="monospace"
+                >
+                  Scale {DRAWING_SCALE_LABEL} (~{SHEET_WIDTH_METERS} m)
+                </text>
+                <g transform="translate(928, 52)">
+                  <polygon
+                    points="0,-16 7,6 -7,6"
+                    fill={themeMode === "blueprint" ? "#60A5FA" : "#94A3B8"}
+                  />
+                  <text
+                    y="20"
+                    textAnchor="middle"
+                    fontSize="10"
+                    fontWeight="bold"
+                    fill={themeMode === "blueprint" ? "#93C5FD" : "#64748B"}
+                    fontFamily="monospace"
+                  >
+                    N
+                  </text>
+                </g>
+                <text
+                  x="500"
+                  y="988"
+                  textAnchor="middle"
+                  fontSize="10"
+                  fill={themeMode === "blueprint" ? "#60A5FA" : "#94A3B8"}
+                  fontFamily="monospace"
+                >
+                  {playgroundSheets.find((s) => s.id === activeSheetId)?.name ?? "Ground Floor"}
+                </text>
+              </g>
+
               {/* 1. Draw grid line overlays depending on theme */}
-              {themeMode === "classic" && (
-                <defs>
+              <defs>
+                {themeMode === "classic" && (
                   <pattern id="light-grid" width="50" height="50" patternUnits="userSpaceOnUse">
                     <line x1="50" y1="0" x2="50" y2="50" stroke="#f1f3f5" strokeWidth="1" />
                     <line x1="0" y1="50" x2="50" y2="50" stroke="#f1f3f5" strokeWidth="1" />
                   </pattern>
-                </defs>
+                )}
+                {showTracingImages &&
+                  sheetBgImages
+                    .filter((bg) => bg.extracted && bg.showReferencePhoto !== false)
+                    .map((bg) => {
+                      const bounds = getRoomGroupBounds(bg.id, sheetWalls, sheetDoors, sheetWindows, sheetRooms, sheetFixtures);
+                      if (!bounds) return null;
+                      const pad = 20;
+                      return (
+                        <clipPath key={`clip-ref-${bg.id}`} id={`clip-ref-${bg.id}`}>
+                          <rect
+                            x={bounds.minX - pad}
+                            y={bounds.minY - pad}
+                            width={bounds.maxX - bounds.minX + pad * 2}
+                            height={bounds.maxY - bounds.minY + pad * 2}
+                            rx="6"
+                          />
+                        </clipPath>
+                      );
+                    })}
+              </defs>
+
+              {/* Clipped reference photos under vectors — aligned to extraction transform */}
+              {showTracingImages &&
+                sheetBgImages.map((bg) => {
+                  if (!bg.extracted || bg.showReferencePhoto === false) return null;
+                  const bounds = getRoomGroupBounds(bg.id, sheetWalls, sheetDoors, sheetWindows, sheetRooms, sheetFixtures);
+                  if (!bounds) return null;
+                  const halfW = bg.width / 2;
+                  const halfH = bg.height / 2;
+                  return (
+                    <g
+                      key={`ref-photo-${bg.id}`}
+                      clipPath={`url(#clip-ref-${bg.id})`}
+                      transform={`translate(${bg.x}, ${bg.y}) scale(${bg.scale}) rotate(${bg.rotation})`}
+                      style={{ pointerEvents: "none" }}
+                    >
+                      <image
+                        href={bg.url}
+                        x={-halfW}
+                        y={-halfH}
+                        width={bg.width}
+                        height={bg.height}
+                        opacity={imageOpacity}
+                      />
+                    </g>
+                  );
+                })}
+
+              {/* User highlights for missed items (door beside glass, etc.) */}
+              {sheetHighlights.map((h) => {
+                const x = Math.min(h.x1, h.x2);
+                const y = Math.min(h.y1, h.y2);
+                const w = Math.abs(h.x2 - h.x1);
+                const height = Math.abs(h.y2 - h.y1);
+                return (
+                  <g key={h.id} style={{ pointerEvents: "none" }}>
+                    <rect
+                      x={x}
+                      y={y}
+                      width={w}
+                      height={height}
+                      fill="rgba(251, 191, 36, 0.22)"
+                      stroke="#F59E0B"
+                      strokeWidth="2"
+                      strokeDasharray="6 4"
+                      rx="3"
+                    />
+                    <text
+                      x={x + 6}
+                      y={y + 14}
+                      fontSize="9"
+                      fontWeight="bold"
+                      fill="#B45309"
+                      fontFamily="monospace"
+                    >
+                      {h.label ?? "missed"}
+                    </text>
+                  </g>
+                );
+              })}
+              {drawingHighlightStart && tempMousePos && tool === "highlight_miss" && (
+                <rect
+                  x={Math.min(drawingHighlightStart.x, tempMousePos.x)}
+                  y={Math.min(drawingHighlightStart.y, tempMousePos.y)}
+                  width={Math.abs(tempMousePos.x - drawingHighlightStart.x)}
+                  height={Math.abs(tempMousePos.y - drawingHighlightStart.y)}
+                  fill="rgba(251, 191, 36, 0.15)"
+                  stroke="#F59E0B"
+                  strokeWidth="2"
+                  strokeDasharray="4 3"
+                  style={{ pointerEvents: "none" }}
+                />
               )}
 
               {/* 2. Drawing ALL Walls segments */}
-              {walls.map((wall) => {
+              {sheetWalls.map((wall) => {
                 const isSelected = selectedElement.type === "wall" && selectedElement.id === wall.id;
                 const { thickness, color, dashed } = getWallStyle(wall.type, themeMode);
 
@@ -2414,7 +3485,7 @@ ${cellsXml}      </root>
                 return (
                   <g id="drafting-erasure-masks">
                     {/* Doors erasure masks */}
-                    {doors.map((door) => {
+                    {sheetDoors.map((door) => {
                       const size = door.width;
                       return (
                         <line
@@ -2430,7 +3501,7 @@ ${cellsXml}      </root>
                       );
                     })}
                     {/* Windows erasure masks */}
-                    {windows.map((win) => {
+                    {sheetWindows.map((win) => {
                       const w = win.width;
                       return (
                         <line
@@ -2450,7 +3521,7 @@ ${cellsXml}      </root>
               })()}
 
               {/* 3. Drawing ALL Windows segments */}
-              {windows.map((win) => {
+              {sheetWindows.map((win) => {
                 const isSelected = selectedElement.type === "window" && selectedElement.id === win.id;
                 return (
                   <g key={win.id}>
@@ -2460,7 +3531,7 @@ ${cellsXml}      </root>
               })}
 
               {/* 4. Drawing ALL Doors (hinged, sliding, folding, pocket, double) */}
-              {doors.map((door) => {
+              {sheetDoors.map((door) => {
                 const isSelected = selectedElement.type === "door" && selectedElement.id === door.id;
 
                 return (
@@ -2471,7 +3542,7 @@ ${cellsXml}      </root>
               })}
 
               {/* 4b. Drawing ALL placed Fixtures / Furniture stamps */}
-              {fixtures.map((fixture) => {
+              {sheetFixtures.map((fixture) => {
                 const isSelected = selectedElement.type === "fixture" && selectedElement.id === fixture.id;
                 const halfW = fixture.width / 2;
                 const halfH = fixture.height / 2;
@@ -2486,17 +3557,30 @@ ${cellsXml}      </root>
                   >
                     {/* Glowing highlight border boundary circle/card on selection */}
                     {isSelected && (
-                      <rect
-                        x={-halfW - 6}
-                        y={-halfH - 6}
-                        width={fixture.width + 12}
-                        height={fixture.height + 12}
-                        fill="none"
-                        stroke="#F43F5E"
-                        strokeWidth="2.5"
-                        strokeDasharray="5 3"
-                        rx="4"
-                      />
+                      <>
+                        <rect
+                          x={-halfW - 6}
+                          y={-halfH - 6}
+                          width={fixture.width + 12}
+                          height={fixture.height + 12}
+                          fill="none"
+                          stroke="#F43F5E"
+                          strokeWidth="2.5"
+                          strokeDasharray="5 3"
+                          rx="4"
+                        />
+                        <line x1={0} y1={-halfH - 6} x2={0} y2={-halfH - 20} stroke="#6366F1" strokeWidth="2" />
+                        <circle cx={0} cy={-halfH - 22} r={7} fill="#6366F1" className="cursor-grab" />
+                        <rect
+                          x={halfW - 5}
+                          y={halfH - 5}
+                          width={10}
+                          height={10}
+                          fill="#6366F1"
+                          rx={1}
+                          className="cursor-nwse-resize"
+                        />
+                      </>
                     )}
 
                     {/* Generous mouse hit target */}
@@ -2641,13 +3725,96 @@ ${cellsXml}      </root>
                             </g>
                           );
                         }
+                        case "cabinet":
+                        case "wall_cabinet": {
+                          const isUpper = fixture.type === "wall_cabinet";
+                          return (
+                            <g>
+                              <rect
+                                x={-halfW}
+                                y={-halfH}
+                                width={fixture.width}
+                                height={fixture.height}
+                                fill={isUpper ? fillCol : "#E2E8F0"}
+                                stroke={strokeCol}
+                                strokeWidth="2"
+                                rx="2"
+                              />
+                              {!isUpper &&
+                                Array.from({ length: Math.min(6, Math.floor(fixture.width / 28)) }).map((_, i) => {
+                                  const lx = -halfW + (i + 1) * (fixture.width / (Math.floor(fixture.width / 28) + 1));
+                                  return (
+                                    <line key={i} x1={lx} y1={-halfH + 2} x2={lx} y2={halfH - 2} stroke={strokeCol} strokeWidth="1" opacity="0.5" />
+                                  );
+                                })}
+                              <text textAnchor="middle" y="3" fontSize="8" className="fill-slate-500 font-bold">
+                                {isUpper ? "upper" : "base"}
+                              </text>
+                            </g>
+                          );
+                        }
+                        case "counter": {
+                          return (
+                            <g>
+                              <rect x={-halfW} y={-halfH} width={fixture.width} height={fixture.height} fill="#CBD5E1" stroke={strokeCol} strokeWidth="2" rx="1" />
+                              <line x1={-halfW} y1={0} x2={halfW} y2={0} stroke={strokeCol} strokeWidth="1" strokeDasharray="4 3" />
+                            </g>
+                          );
+                        }
+                        case "island": {
+                          return (
+                            <g>
+                              <rect x={-halfW} y={-halfH} width={fixture.width} height={fixture.height} fill="#E2E8F0" stroke={strokeCol} strokeWidth="2.5" rx="4" />
+                              <rect x={-halfW + 6} y={-halfH + 6} width={fixture.width - 12} height={fixture.height - 12} fill="none" stroke={strokeCol} strokeWidth="1.5" rx="2" />
+                            </g>
+                          );
+                        }
+                        case "fridge": {
+                          return (
+                            <g>
+                              <rect x={-halfW} y={-halfH} width={fixture.width} height={fixture.height} fill={fillCol} stroke={strokeCol} strokeWidth="2.5" rx="2" />
+                              <line x1={-halfW} y1={-halfH / 3} x2={halfW} y2={-halfH / 3} stroke={strokeCol} strokeWidth="2" />
+                              <rect x={-halfW + 4} y={-halfH + 4} width={8} height={halfH / 3 - 6} fill="none" stroke={strokeCol} strokeWidth="1" rx="1" />
+                            </g>
+                          );
+                        }
+                        case "dishwasher":
+                        case "washing_machine": {
+                          return (
+                            <g>
+                              <rect x={-halfW} y={-halfH} width={fixture.width} height={fixture.height} fill={fillCol} stroke={strokeCol} strokeWidth="2.5" rx="2" />
+                              <circle cx="0" cy="2" r={Math.min(halfW, halfH) - 6} fill="none" stroke={strokeCol} strokeWidth="2" />
+                            </g>
+                          );
+                        }
                         case "column": {
                           return (
                             <g>
-                              {/* Solid engineering pillar */}
                               <rect x={-halfW} y={-halfH} width={fixture.width} height={fixture.height} fill={strokeCol} stroke={strokeCol} strokeWidth="1" />
                               <line x1={-halfW} y1={-halfH} x2={halfW} y2={halfH} stroke={themeMode==="blueprint"?"#000000":"#FFFFFF"} strokeWidth="1.5" />
                               <line x1={halfW} y1={-halfH} x2={-halfW} y2={halfH} stroke={themeMode==="blueprint"?"#000000":"#FFFFFF"} strokeWidth="1.5" />
+                            </g>
+                          );
+                        }
+                        case "balcony":
+                        case "patio": {
+                          return (
+                            <g>
+                              <rect
+                                x={-halfW}
+                                y={-halfH}
+                                width={fixture.width}
+                                height={fixture.height}
+                                fill={themeMode === "blueprint" ? "rgba(34,197,94,0.15)" : "rgba(34,197,94,0.12)"}
+                                stroke={themeMode === "blueprint" ? "#22C55E" : "#16A34A"}
+                                strokeWidth="2"
+                                strokeDasharray="6 3"
+                                rx="3"
+                              />
+                              <line x1={-halfW} y1={-halfH + 8} x2={halfW} y2={-halfH + 8} stroke={themeMode === "blueprint" ? "#22C55E" : "#16A34A"} strokeWidth="1.5" />
+                              <text textAnchor="middle" y="4" fontSize="9" fontWeight="bold" className={themeMode === "blueprint" ? "fill-green-400" : "fill-green-700"}>
+                                {fixture.type === "balcony" ? "BALCONY" : "PATIO"}
+                              </text>
                             </g>
                           );
                         }
@@ -2715,7 +3882,7 @@ ${cellsXml}      </root>
               )}
 
               {/* 6. Drawing ALL Rooms text badges labels */}
-              {rooms.map((room) => {
+              {sheetRooms.map((room) => {
                 const isSelected = selectedElement.type === "room" && selectedElement.id === room.id;
                 return (
                   <g key={room.id} className="cursor-move">
@@ -2758,6 +3925,53 @@ ${cellsXml}      </root>
                   </g>
                 );
               })}
+
+              {/* Extracted room groups — drag anywhere in the frame to reposition the whole room */}
+              {sheetBgImages
+                .filter((bg) => bg.extracted)
+                .map((bg) => {
+                  const bounds = getRoomGroupBounds(bg.id, sheetWalls, sheetDoors, sheetWindows, sheetRooms, sheetFixtures);
+                  if (!bounds) return null;
+                  const pad = 16;
+                  const isSelected = selectedBgId === bg.id;
+                  const winFacing = inferGroupWindowFacing(bg.id, walls, windows);
+                  const facingTag = winFacing ? ` · window ${winFacing}` : "";
+                  const labelText = `🏠 ${bg.name}${facingTag}`;
+                  const labelW = Math.max(120, labelText.length * 6.2 + 24);
+                  return (
+                    <g key={`room-group-${bg.id}`} style={{ pointerEvents: "none" }}>
+                      <rect
+                        x={bounds.minX - pad}
+                        y={bounds.minY - pad}
+                        width={bounds.maxX - bounds.minX + pad * 2}
+                        height={bounds.maxY - bounds.minY + pad * 2}
+                        fill={isSelected ? "rgba(99,102,241,0.07)" : "rgba(99,102,241,0.03)"}
+                        stroke={isSelected ? "#6366F1" : "#C7D2FE"}
+                        strokeWidth={isSelected ? 2.5 : 1.5}
+                        strokeDasharray="10 5"
+                        rx="8"
+                      />
+                      <rect
+                        x={bounds.minX - pad + 4}
+                        y={bounds.minY - pad - 20}
+                        width={labelW}
+                        height="18"
+                        rx="4"
+                        fill="#4F46E5"
+                      />
+                      <text
+                        x={bounds.minX - pad + 12}
+                        y={bounds.minY - pad - 7}
+                        fill="#FFFFFF"
+                        fontSize="9.5"
+                        fontWeight="bold"
+                        fontFamily="monospace"
+                      >
+                        {labelText}
+                      </text>
+                    </g>
+                  );
+                })}
 
               {/* 7. Draw dragging joint circle highlights (Very intuitive CAD vertex editors!) */}
               {tool === "select" && (
@@ -2814,7 +4028,7 @@ ${cellsXml}      </root>
               )}
 
               {/* 3b. Render Custom Saved Dimension lines with elegant drafting details */}
-              {dimensionLines.map((dim) => {
+              {sheetDimensionLines.map((dim) => {
                 const midX = (dim.x1 + dim.x2) / 2;
                 const midY = (dim.y1 + dim.y2) / 2;
                 const angle = Math.atan2(dim.y2 - dim.y1, dim.x2 - dim.x1) * (180 / Math.PI);
@@ -2956,7 +4170,7 @@ ${cellsXml}      </root>
           </div>
 
           {/* BELOW CANVAS SLIDER FOR TRACING IMAGE OPACITY */}
-          {uploadedImage && (
+          {(uploadedImage || bgImages.some((b) => b.extracted && b.showReferencePhoto !== false)) && (
             <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 shadow-sm">
               <div className="flex items-center gap-3">
                 <label className="relative inline-flex items-center cursor-pointer select-none">
@@ -2968,7 +4182,7 @@ ${cellsXml}      </root>
                   />
                   <div className="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-600"></div>
                   <span className="ml-2.5 text-xs font-semibold text-slate-700">
-                    Show Tracing Template Images
+                    Show Reference Photos
                   </span>
                 </label>
               </div>
@@ -3035,9 +4249,9 @@ ${cellsXml}      </root>
               <Upload className="w-5.5 h-5.5" />
             </div>
             <div>
-              <span className="text-xs text-indigo-700 font-bold block">Upload Floorplan Image</span>
+              <span className="text-xs text-indigo-700 font-bold block">Upload Room Images</span>
               <p className="text-[10px] text-slate-400 mt-1">
-                Upload a sketch, scan, or photo — AI extracts walls, doors, windows, stairs & fixtures into the playground
+                Upload photos, sketches, or scans of each room. AI reconstructs a floor plan per block — arrange blocks like Lego to build the full plan.
               </p>
               {isCloudApiEnabled() && (
                 <div className="mt-2 p-2 bg-slate-50 rounded-lg border border-slate-100 space-y-2">
@@ -3098,13 +4312,13 @@ ${cellsXml}      </root>
           </div>
 
           {/* PLACED LEGO IMAGES LIST */}
-          {bgImages.length > 0 && (
+          {sheetBgImages.length > 0 && (
             <div className="mt-4 border-t border-slate-100 pt-4">
               <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">
-                🧩 Placed Lego Layers ({bgImages.length})
+                {sheetBgImages.some((b) => b.extracted) ? "✅ Extracted Rooms" : "🧩 Room Blocks"} ({sheetBgImages.length})
               </label>
               <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
-                {bgImages.map((bg) => {
+                {sheetBgImages.map((bg) => {
                   const isSelected = selectedBgId === bg.id;
                   return (
                     <div
@@ -3119,7 +4333,7 @@ ${cellsXml}      </root>
                       <div className="flex items-center gap-2 truncate pr-2">
                         <span className="text-sm">🧩</span>
                         <span className={`font-medium ${isSelected ? "text-indigo-900 font-semibold" : "text-slate-700"}`}>
-                          {bg.name}
+                          {bg.extracted ? "✓ " : ""}{bg.name}
                         </span>
                       </div>
                       <div className="flex items-center gap-1">
@@ -3159,6 +4373,7 @@ ${cellsXml}      </root>
                             }
 
                             setBgImages((prev) => prev.filter((item) => item.id !== bg.id));
+                            setMissedHighlights((prev) => prev.filter((h) => h.bgImageId !== bg.id));
                             if (selectedBgId === bg.id) setSelectedBgId(null);
                           }}
                           className="p-1 rounded text-rose-500 hover:bg-rose-100/50 transition-colors cursor-pointer"
@@ -3181,7 +4396,8 @@ ${cellsXml}      </root>
               <div className="mt-4 border-t border-indigo-100 pt-4 bg-indigo-50/30 p-3 rounded-lg border border-indigo-50 animate-fadeIn text-xs space-y-3">
                 <div className="flex items-center justify-between">
                   <span className="font-bold text-indigo-900 flex items-center gap-1">
-                    🔧 Edit Block: <span className="font-mono text-indigo-700">{selectedBg.name.slice(0, 16)}</span>
+                    {selectedBg.extracted ? "🏠" : "🔧"} {selectedBg.extracted ? "Room" : "Edit Block"}:{" "}
+                    <span className="font-mono text-indigo-700">{selectedBg.name.slice(0, 20)}</span>
                   </span>
                   <button
                     onClick={() => setSelectedBgId(null)}
@@ -3191,49 +4407,231 @@ ${cellsXml}      </root>
                   </button>
                 </div>
 
-                {/* BLOCK LABEL */}
                 <div>
-                  <span className="text-[10px] text-slate-500 font-medium">Custom Block Name (e.g. Bedroom 3)</span>
+                  <span className="text-[10px] text-slate-500 font-medium">
+                    Room Name {selectedBg.extracted ? "(AI detected — editable)" : "(editable)"}
+                  </span>
                   <input
                     type="text"
                     value={selectedBg.name}
                     onChange={(e) => updateSelectedBgImage({ name: e.target.value })}
                     className="w-full text-xs px-2.5 py-1.5 bg-white border border-slate-200 rounded mt-1 text-slate-800"
+                    placeholder="e.g. Living Room, Kitchen"
                   />
                 </div>
 
-                {/* ROTATION SLIDER */}
+                <div>
+                  <span className="text-[10px] text-slate-500 font-medium block">
+                    Window / glass faces (on property)
+                  </span>
+                  <p className="text-[9px] text-slate-400 mt-0.5 mb-1.5 leading-relaxed">
+                    Photos look into the room. Set which way the glazed wall faces so rooms connect correctly — e.g. kitchen south, living room north.
+                  </p>
+                  <div className="grid grid-cols-4 gap-1">
+                    {(
+                      [
+                        { id: "north" as const, label: "N ↑" },
+                        { id: "south" as const, label: "S ↓" },
+                        { id: "east" as const, label: "E →" },
+                        { id: "west" as const, label: "W ←" },
+                      ] as const
+                    ).map((dir) => {
+                      const active =
+                        (selectedBg.windowFacing ?? "north") === dir.id;
+                      return (
+                        <button
+                          key={dir.id}
+                          type="button"
+                          onClick={() => updateSelectedBgImage({ windowFacing: dir.id })}
+                          className={`py-1.5 rounded text-[10px] font-bold border transition-colors cursor-pointer ${
+                            active
+                              ? "bg-indigo-600 text-white border-indigo-600"
+                              : "bg-white text-slate-600 border-slate-200 hover:border-indigo-300"
+                          }`}
+                        >
+                          {dir.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {selectedBg.extracted && selectedBg.roomWidthM && selectedBg.roomDepthM && (
+                  <div className="bg-white/70 px-2.5 py-2 rounded-lg border border-indigo-100 text-[10px] text-slate-600">
+                    <span className="font-bold text-indigo-700">
+                      {selectedBg.roomWidthM} × {selectedBg.roomDepthM} m
+                    </span>
+                    <span className="text-slate-400 block mt-0.5">
+                      Playground scale: {PLAYGROUND_PX_PER_M} px/m — sizes differ per room
+                    </span>
+                  </div>
+                )}
+
                 <div>
                   <div className="flex items-center justify-between text-[10px] text-slate-500">
-                    <span>Rotate Block Degree</span>
+                    <span>
+                      {selectedBg.extracted ? "Rotate room group" : "Rotate block"}
+                    </span>
                     <span className="font-bold font-mono text-indigo-600">{selectedBg.rotation}°</span>
+                  </div>
+                  {selectedBg.extracted && (
+                    <p className="text-[9px] text-slate-400 mt-0.5 mb-1">
+                      Spin to align adjoining rooms — e.g. rotate kitchen 180° so its south window does not open into the living room.
+                    </p>
+                  )}
+                  <div className="flex gap-1 mt-1.5 mb-1.5">
+                    <button
+                      type="button"
+                      onClick={() => rotateRoomGroupBy(-90)}
+                      className="flex-1 py-1.5 bg-white hover:bg-indigo-50 border border-slate-200 rounded text-[10px] font-semibold text-slate-700 cursor-pointer"
+                    >
+                      ↺ 90°
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => rotateRoomGroupBy(90)}
+                      className="flex-1 py-1.5 bg-white hover:bg-indigo-50 border border-slate-200 rounded text-[10px] font-semibold text-slate-700 cursor-pointer"
+                    >
+                      ↻ 90°
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => rotateRoomGroupBy(180)}
+                      className="flex-1 py-1.5 bg-white hover:bg-indigo-50 border border-slate-200 rounded text-[10px] font-semibold text-slate-700 cursor-pointer"
+                    >
+                      180°
+                    </button>
                   </div>
                   <input
                     type="range"
                     min="0"
                     max="360"
                     value={selectedBg.rotation}
+                    onMouseDown={() => saveHistoryState()}
                     onChange={(e) => updateSelectedBgImage({ rotation: parseInt(e.target.value) })}
-                    className="w-full accent-indigo-600 h-1 bg-slate-200 rounded mt-1.5 cursor-pointer"
+                    className="w-full accent-indigo-600 h-1 bg-slate-200 rounded cursor-pointer"
                   />
                 </div>
 
-                {/* SIZING SCALE SLIDER */}
-                <div>
-                  <div className="flex items-center justify-between text-[10px] text-slate-500">
-                    <span>Scale / Dimension multiplier</span>
-                    <span className="font-bold font-mono text-indigo-600">x{selectedBg.scale.toFixed(2)}</span>
+                {selectedBg.extracted && (
+                  <div className="space-y-2.5 pt-1 border-t border-indigo-100/60">
+                    <div className="flex items-center justify-between">
+                      <label className="flex items-center gap-2 text-[10px] text-slate-600 font-medium cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={selectedBg.showReferencePhoto !== false}
+                          onChange={(e) =>
+                            updateSelectedBgImage({ showReferencePhoto: e.target.checked })
+                          }
+                          className="accent-indigo-600"
+                        />
+                        Show clipped reference photo
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          saveHistoryState();
+                          updateSelectedBgImage({ showReferencePhoto: false });
+                          setMissedHighlights((prev) =>
+                            prev.filter((h) => h.bgImageId !== selectedBg.id)
+                          );
+                          triggerNotification(
+                            `Reference photo hidden for "${selectedBg.name}". Vectors kept — add items manually or re-enable photo.`
+                          );
+                        }}
+                        className="text-[9px] text-rose-600 hover:text-rose-700 underline cursor-pointer"
+                      >
+                        Remove photo
+                      </button>
+                    </div>
+                    <p className="text-[9px] text-slate-400 leading-relaxed">
+                      Photo stays aligned under the floor plan for scale. Highlight missed doors/windows, or place items manually over the photo.
+                    </p>
+
+                    {selectedBg.showReferencePhoto !== false && (
+                      <div className="bg-white/70 p-2.5 rounded-lg border border-amber-100 space-y-2">
+                        <span className="text-[9px] font-bold text-amber-700 uppercase tracking-wider block">
+                          Mark missed items
+                        </span>
+                        <select
+                          value={highlightItemType}
+                          onChange={(e) =>
+                            setHighlightItemType(e.target.value as "door" | "window" | "fixture")
+                          }
+                          className="w-full text-xs px-2 py-1.5 bg-white border border-slate-200 rounded"
+                        >
+                          <option value="door">Door (e.g. beside glass wall)</option>
+                          <option value="window">Window / glass panel</option>
+                          <option value="fixture">Fixture / furniture</option>
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setTool("highlight_miss");
+                            triggerNotification(
+                              "Drag on the reference photo to draw highlight boxes over missed items."
+                            );
+                          }}
+                          className={`w-full py-1.5 rounded-lg text-[10px] font-semibold border transition-colors cursor-pointer ${
+                            tool === "highlight_miss"
+                              ? "bg-amber-100 border-amber-300 text-amber-900"
+                              : "bg-white border-amber-200 text-amber-800 hover:bg-amber-50"
+                          }`}
+                        >
+                          {tool === "highlight_miss" ? "Drawing highlights…" : "Draw highlight regions"}
+                        </button>
+                        {missedHighlights.filter((h) => h.bgImageId === selectedBg.id).length > 0 && (
+                          <div className="flex flex-col gap-1.5">
+                            <span className="text-[9px] text-slate-500">
+                              {missedHighlights.filter((h) => h.bgImageId === selectedBg.id).length}{" "}
+                              highlight(s) ready
+                            </span>
+                            <button
+                              type="button"
+                              disabled={isConverting}
+                              onClick={() => handleRefineMissedHighlights()}
+                              className="w-full py-2 bg-amber-500 hover:bg-amber-600 disabled:opacity-50 text-white text-[10px] font-bold rounded-lg cursor-pointer"
+                            >
+                              {isConverting ? "Finding missed items…" : "AI: add highlighted items"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                saveHistoryState();
+                                setMissedHighlights((prev) =>
+                                  prev.filter((h) => h.bgImageId !== selectedBg.id)
+                                );
+                              }}
+                              className="w-full py-1 text-[9px] text-slate-500 hover:text-slate-700 underline cursor-pointer"
+                            >
+                              Clear highlights
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
-                  <input
-                    type="range"
-                    min="0.30"
-                    max="2.50"
-                    step="0.05"
-                    value={selectedBg.scale}
-                    onChange={(e) => updateSelectedBgImage({ scale: parseFloat(e.target.value) })}
-                    className="w-full accent-indigo-600 h-1 bg-slate-200 rounded mt-1.5 cursor-pointer"
-                  />
-                </div>
+                )}
+
+                {!selectedBg.extracted && (
+                  <>
+                    <div>
+                      <div className="flex items-center justify-between text-[10px] text-slate-500">
+                        <span>Scale / Dimension multiplier</span>
+                        <span className="font-bold font-mono text-indigo-600">x{selectedBg.scale.toFixed(2)}</span>
+                      </div>
+                      <input
+                        type="range"
+                        min="0.30"
+                        max="2.50"
+                        step="0.05"
+                        value={selectedBg.scale}
+                        onChange={(e) => updateSelectedBgImage({ scale: parseFloat(e.target.value) })}
+                        className="w-full accent-indigo-600 h-1 bg-slate-200 rounded mt-1.5 cursor-pointer"
+                      />
+                    </div>
+                  </>
+                )}
 
                 {/* TRANSLATION SLIDERS */}
                 <div className="grid grid-cols-2 gap-2 pt-1">
@@ -3311,15 +4709,6 @@ ${cellsXml}      </root>
                           </p>
                         </div>
 
-                        {/* Primary AI Digitize Block Button */}
-                        <button
-                          onClick={() => handleDigitizeFloorplan()}
-                          disabled={isConverting}
-                          className="w-full py-2 px-3 bg-indigo-600 hover:bg-indigo-750 text-white rounded font-bold text-xs flex items-center justify-center gap-1.5 shadow-sm transition-all cursor-pointer disabled:opacity-50"
-                        >
-                          <span className="text-sm">✨</span>
-                          {isConverting ? "Scanning & Drawing..." : "AI Extract / Digitize This Block"}
-                        </button>
                       </>
                     );
                   })()}
@@ -3363,24 +4752,37 @@ ${cellsXml}      </root>
             />
           </div>
 
-          {/* Extract Floorplan layout trigger */}
-          <button
-            onClick={handleDigitizeFloorplan}
-            disabled={isConverting || !uploadedImage}
-            className="mt-3.5 w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:opacity-50 disabled:text-slate-400 text-white font-medium text-xs py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer"
-          >
-            {isConverting ? (
-              <>
-                <RefreshCw className="w-4 h-4 animate-spin text-white" />
-                Processing Blueprint Vector Details...
-              </>
-            ) : (
-              <>
-                <Sparkles className="w-4 h-4 text-slate-200" />
-                Extract to Playground (AI)
-              </>
+          <div className="mt-3.5 flex flex-col gap-2">
+            <button
+              onClick={() => handleDigitizeAllBlocks()}
+              disabled={isConverting || bgImages.length === 0}
+              className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-100 disabled:opacity-50 disabled:text-slate-400 text-white font-medium text-xs py-2.5 px-4 rounded-lg flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer"
+            >
+              {isConverting ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin text-white" />
+                  Extracting all blocks...
+                </>
+              ) : (
+                <>
+                  <Sparkles className="w-4 h-4 text-slate-200" />
+                  Extract All Blocks ({bgImages.length})
+                </>
+              )}
+            </button>
+            {selectedBgId && (
+              <button
+                onClick={() => handleDigitizeFloorplan()}
+                disabled={isConverting}
+                className="w-full bg-white hover:bg-indigo-50 border border-indigo-200 text-indigo-700 font-medium text-xs py-2 px-4 rounded-lg flex items-center justify-center gap-2 transition-all cursor-pointer disabled:opacity-50"
+              >
+                Re-extract selected block only
+              </button>
             )}
-          </button>
+          </div>
+          <p className="mt-2 text-[10px] text-slate-400 leading-relaxed">
+            Set each room&apos;s window direction (N/S/E/W) before extract. After extract, use ↻ 90° / 180° to rotate room groups so adjoining rooms connect Lego-style. Click furniture to edit; drag empty area to move the group.
+          </p>
         </div>
 
         {/* MENU NAVIGATION TAB SYSTEM */}
@@ -4834,11 +6236,14 @@ ${cellsXml}      </root>
           </span>
           <span className="h-4 w-px bg-slate-200" />
           <span>
-            <strong>Scale Calibration:</strong>{" "}
-            {scale.calibrated ? (
-              <span className="text-teal-600 font-semibold font-mono">ACTIVE (1px = {(scale.physicalLength / scale.pixelDistance).toFixed(3)}{scale.unit})</span>
-            ) : (
-              <span className="text-slate-400">Uncalibrated (Pixels only)</span>
+            <strong>Drawing scale:</strong>{" "}
+            <span className="text-teal-600 font-semibold font-mono">
+              {DRAWING_SCALE_LABEL} (~{PLAYGROUND_PX_PER_M} px/m · {SHEET_WIDTH_METERS} m sheet)
+            </span>
+            {scale.calibrated && (
+              <span className="text-slate-400 ml-1">
+                · calibrated 1px = {(scale.physicalLength / scale.pixelDistance).toFixed(3)}{scale.unit}
+              </span>
             )}
           </span>
         </div>
@@ -4895,7 +6300,7 @@ ${cellsXml}      </root>
               className="print-blueprint-svg bg-white"
             >
               {/* Drawing ALL walls for print */}
-              {walls.map((wall) => {
+              {sheetWalls.map((wall) => {
                 const thickness = wall.type === "exterior" ? 11 : 5.5;
                 const strokeColor = "#111827"; // Dark grey slate for clear print contrasts
                 return (
@@ -4922,7 +6327,7 @@ ${cellsXml}      </root>
               })}
 
               {/* Drawing ALL doors print */}
-              {doors.map((door) => {
+              {sheetDoors.map((door) => {
                 const size = door.width;
                 return (
                   <g key={`print_${door.id}`}>
@@ -4955,7 +6360,7 @@ ${cellsXml}      </root>
               })}
 
               {/* Drawing ALL Windows print */}
-              {windows.map((win) => {
+              {sheetWindows.map((win) => {
                 const size = win.width;
                 const wVal = win.orientation === "h" ? size : 12;
                 const hVal = win.orientation === "v" ? size : 12;

@@ -1,5 +1,6 @@
 import {
   extractFloorplanFromImage,
+  extractMissedItemsFromImage,
   validateOpenRouterApiKey,
 } from "./floorplanExtraction";
 import { DEFAULT_EXTRACTION_MODEL, EXTRACTION_MODELS } from "./openRouterModels";
@@ -328,18 +329,39 @@ async function handleConvert(request: Request, env: Env, cors: HeadersInit): Pro
     const body = (await request.json()) as {
       image?: string;
       additionalContext?: string;
+      roomLabel?: string;
       model?: string;
+      windowFacing?: "north" | "south" | "east" | "west" | "auto";
+      highlightRegions?: Array<{
+        x1: number;
+        y1: number;
+        x2: number;
+        y2: number;
+        label?: string;
+      }>;
     };
     if (!body.image) {
       return json({ error: "Missing image in request body" }, 400, cors);
     }
 
     const apiKey = validateOpenRouterApiKey(env.OPENROUTER_API_KEY);
-    const parsed = await extractFloorplanFromImage(apiKey, body.image, {
-      additionalContext: body.additionalContext,
-      model: body.model,
-      defaultModel: env.DEFAULT_EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL,
-    });
+    const defaultModel = env.DEFAULT_EXTRACTION_MODEL ?? DEFAULT_EXTRACTION_MODEL;
+    const parsed =
+      body.highlightRegions && body.highlightRegions.length > 0
+        ? await extractMissedItemsFromImage(apiKey, body.image, {
+            additionalContext: body.additionalContext,
+            roomLabel: body.roomLabel,
+            model: body.model,
+            defaultModel,
+            highlightRegions: body.highlightRegions,
+          })
+        : await extractFloorplanFromImage(apiKey, body.image, {
+            additionalContext: body.additionalContext,
+            roomLabel: body.roomLabel,
+            model: body.model,
+            defaultModel,
+            windowFacing: body.windowFacing,
+          });
     return json(parsed, 200, cors);
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : "Conversion failed";
